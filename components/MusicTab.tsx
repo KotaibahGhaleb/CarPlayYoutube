@@ -16,6 +16,7 @@ import {
   type SavedPlaylist,
   type Song,
 } from "@/lib/music";
+import { useRemote, useRemoteCommands } from "./RemoteProvider";
 import NowPlaying from "./NowPlaying";
 
 // YouTube IFrame API — last-resort playback path. When our stream extraction
@@ -56,6 +57,7 @@ function Heart({ filled }: { filled: boolean }) {
 }
 
 export default function MusicTab() {
+  const remote = useRemote();
   const [listTitle, setListTitle] = useState("Top Songs");
   const [songs, setSongs] = useState<Song[]>([]);
   const [loadingList, setLoadingList] = useState(false);
@@ -194,11 +196,22 @@ export default function MusicTab() {
   const playAt = useCallback(async (list: Song[], index: number) => {
     const song = list[index];
     if (!song) return;
+    if (remote.mode === "remote") {
+      remote.send({ t: "music-play", songs: list, index });
+      return;
+    }
     const req = ++reqRef.current;
     stopIframe();
     setUseIframe(false);
     setQueue({ songs: list, index });
     setShowNow(true);
+    // tell the paired phone what's playing (no-op unless hosting)
+    remote.send({
+      t: "np",
+      name: song.name,
+      artist: song.artist,
+      art: song.art,
+    });
     setResolving(true);
     setStreamError("");
     setLyrics(null);
@@ -254,7 +267,7 @@ export default function MusicTab() {
 
     const l = await lyricsPromise;
     if (req === reqRef.current) setLyrics(l);
-  }, [stopIframe]);
+  }, [stopIframe, remote]);
 
   playAtRef.current = playAt;
 
@@ -301,11 +314,19 @@ export default function MusicTab() {
   }, [stopIframe]);
 
   const next = useCallback(() => {
+    if (remote.mode === "remote") {
+      remote.send({ t: "ctl", a: "next" });
+      return;
+    }
     if (!queue) return;
     playAt(queue.songs, (queue.index + 1) % queue.songs.length);
-  }, [queue, playAt]);
+  }, [queue, playAt, remote]);
 
   const prev = useCallback(() => {
+    if (remote.mode === "remote") {
+      remote.send({ t: "ctl", a: "prev" });
+      return;
+    }
     if (useIframe && ytRef.current) {
       const t = ytRef.current.getCurrentTime?.() ?? 0;
       if (t > 3) {
@@ -323,9 +344,13 @@ export default function MusicTab() {
       queue.songs,
       (queue.index - 1 + queue.songs.length) % queue.songs.length
     );
-  }, [queue, playAt, useIframe]);
+  }, [queue, playAt, useIframe, remote]);
 
   const toggle = useCallback(() => {
+    if (remote.mode === "remote") {
+      remote.send({ t: "ctl", a: "toggle" });
+      return;
+    }
     if (useIframe && ytRef.current) {
       if (ytRef.current.getPlayerState?.() === 1) ytRef.current.pauseVideo();
       else ytRef.current.playVideo();
@@ -335,7 +360,57 @@ export default function MusicTab() {
     if (!el) return;
     if (el.paused) el.play().catch(() => {});
     else el.pause();
-  }, [useIframe]);
+  }, [useIframe, remote]);
+
+  const seek = useCallback(
+    (t: number) => {
+      if (remote.mode === "remote") {
+        remote.send({ t: "ctl", a: "seek", v: t });
+        return;
+      }
+      if (useIframe && ytRef.current) ytRef.current.seekTo(t, true);
+      else if (audioRef.current) audioRef.current.currentTime = t;
+      setTime(t);
+    },
+    [useIframe, remote]
+  );
+
+  // car screen: execute commands coming from the paired phone
+  useRemoteCommands((m) => {
+    if (m.t === "music-play" && Array.isArray(m.songs)) {
+      void playAt(m.songs as Song[], Number(m.index) || 0);
+    } else if (m.t === "ctl") {
+      const el = audioRef.current;
+      if (m.a === "toggle") {
+        if (useIframe && ytRef.current) {
+          if (ytRef.current.getPlayerState?.() === 1)
+            ytRef.current.pauseVideo();
+          else ytRef.current.playVideo();
+        } else if (el) {
+          if (el.paused) el.play().catch(() => {});
+          else el.pause();
+        }
+      } else if (m.a === "seek" && typeof m.v === "number") {
+        if (useIframe && ytRef.current) ytRef.current.seekTo(m.v, true);
+        else if (el) el.currentTime = m.v;
+      }
+      // next/prev go through the refs (they may still be mid-render here)
+      else if (m.a === "next" || m.a === "prev") {
+        const q = queueRef.current;
+        if (!q) return;
+        if (m.a === "prev" && el && el.currentTime > 3) {
+          el.currentTime = 0;
+          return;
+        }
+        playAtRef.current?.(
+          q.songs,
+          m.a === "next"
+            ? (q.index + 1) % q.songs.length
+            : (q.index - 1 + q.songs.length) % q.songs.length
+        );
+      }
+    }
+  });
 
   // media session — car/lock-screen controls
   useEffect(() => {
@@ -571,6 +646,55 @@ export default function MusicTab() {
         </button>
       )}
 
+      {/* remote control bar — phone mirroring mode */}
+      {remote.mode === "remote" && remote.carState?.name != null && (
+        <div className="absolute bottom-3 left-1/2 z-40 flex w-[calc(100%-2rem)] max-w-xl -translate-x-1/2 items-center gap-3 rounded-2xl border border-blue-900 bg-neutral-900/95 p-2.5 shadow-xl backdrop-blur">
+          {typeof remote.carState.art === "string" && remote.carState.art && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={remote.carState.art}
+              alt=""
+              className="h-11 w-11 rounded-lg object-cover"
+            />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-bold">
+              {String(remote.carState.name)}
+            </span>
+            <span className="block truncate text-xs text-neutral-400">
+              {String(remote.carState.artist ?? "")} · on car
+            </span>
+          </span>
+          <button
+            onClick={prev}
+            className="flex h-11 w-11 items-center justify-center rounded-full text-neutral-300 hover:bg-neutral-800"
+            aria-label="Previous"
+          >
+            <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
+              <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z" />
+            </svg>
+          </button>
+          <button
+            onClick={toggle}
+            className="flex h-11 w-11 items-center justify-center rounded-full bg-white text-black"
+            aria-label="Play/pause"
+          >
+            <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
+              <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
+            </svg>
+          </button>
+          <button
+            onClick={next}
+            className="flex h-11 w-11 items-center justify-center rounded-full text-neutral-300 hover:bg-neutral-800"
+            aria-label="Next"
+          >
+            <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
+              <path d="M16 6h2v12h-2zM6 18l8.5-6L6 6z" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {/* full now-playing */}
       {showNow && current && (
         <NowPlaying
@@ -584,11 +708,7 @@ export default function MusicTab() {
           onToggle={toggle}
           onNext={next}
           onPrev={prev}
-          onSeek={(t) => {
-            if (useIframe && ytRef.current) ytRef.current.seekTo(t, true);
-            else if (audioRef.current) audioRef.current.currentTime = t;
-            setTime(t);
-          }}
+          onSeek={seek}
           onClose={() => setShowNow(false)}
         />
       )}

@@ -9,6 +9,7 @@ import {
   type PipedSearchItem,
   type PipedStreamsResponse,
 } from "@/lib/piped";
+import { useRemote, useRemoteCommands } from "./RemoteProvider";
 import VideoPlayer from "./VideoPlayer";
 
 function fmtDur(s: number) {
@@ -82,8 +83,14 @@ export default function YouTubeTab() {
     }
   }
 
+  const remote = useRemote();
+
   async function play(item: PipedSearchItem) {
     const id = extractVideoId(item.url);
+    if (remote.mode === "remote") {
+      remote.send({ t: "yt-play", id, item });
+      return;
+    }
     setLoadingStream(true);
     setError("");
     setEmbedFallback(false);
@@ -100,6 +107,11 @@ export default function YouTubeTab() {
       setLoadingStream(false);
     }
   }
+
+  // car screen: phone asked to play a video
+  useRemoteCommands((m) => {
+    if (m.t === "yt-play" && m.item) void play(m.item as PipedSearchItem);
+  });
 
   if (playing) {
     return (

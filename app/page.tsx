@@ -3,6 +3,11 @@
 import { useState } from "react";
 import YouTubeTab from "@/components/YouTubeTab";
 import MusicTab from "@/components/MusicTab";
+import RemoteProvider, {
+  useRemote,
+  useRemoteCommands,
+} from "@/components/RemoteProvider";
+import RemotePanel from "@/components/RemotePanel";
 
 function YouTubeIcon({ className }: { className?: string }) {
   return (
@@ -20,15 +25,36 @@ function MusicIcon({ className }: { className?: string }) {
   );
 }
 
-export default function Home() {
+function RemoteIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className}>
+      <path d="M15 9H9a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-3 8.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3ZM7.05 6.05l1.41 1.41a5 5 0 0 1 7.08 0l1.41-1.41a7 7 0 0 0-9.9 0Zm2.83 2.83 1.41 1.41a1 1 0 0 1 1.42 0l1.41-1.41a3 3 0 0 0-4.24 0Z" />
+    </svg>
+  );
+}
+
+function Shell() {
   const [tab, setTab] = useState<"yt" | "music">("yt");
+  const [showRemote, setShowRemote] = useState(false);
+  const remote = useRemote();
+
+  // Car screen (host) executes commands coming from the phone
+  useRemoteCommands((m) => {
+    if (m.t === "tab" && (m.tab === "yt" || m.tab === "music"))
+      setTab(m.tab);
+  });
+
+  const switchTab = (t: "yt" | "music") => {
+    setTab(t);
+    if (remote.mode === "remote") remote.send({ t: "tab", tab: t });
+  };
 
   return (
     <div className="flex h-dvh">
       {/* CarPlay-style dock */}
       <nav className="flex w-20 shrink-0 flex-col items-center gap-3 border-r border-neutral-800 bg-neutral-950 py-4 md:w-24">
         <button
-          onClick={() => setTab("yt")}
+          onClick={() => switchTab("yt")}
           className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-2xl transition active:scale-90 md:h-20 md:w-20 ${
             tab === "yt"
               ? "bg-red-600/20 text-red-500"
@@ -39,7 +65,7 @@ export default function Home() {
           <span className="text-[10px] font-bold">YouTube</span>
         </button>
         <button
-          onClick={() => setTab("music")}
+          onClick={() => switchTab("music")}
           className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-2xl transition active:scale-90 md:h-20 md:w-20 ${
             tab === "music"
               ? "bg-green-600/20 text-green-500"
@@ -49,16 +75,43 @@ export default function Home() {
           <MusicIcon className="h-7 w-7 fill-current md:h-8 md:w-8" />
           <span className="text-[10px] font-bold">Music</span>
         </button>
+        <div className="mt-auto" />
+        <button
+          onClick={() => setShowRemote(true)}
+          className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-2xl transition active:scale-90 md:h-20 md:w-20 ${
+            remote.mode !== "off"
+              ? "bg-blue-600/20 text-blue-400"
+              : "text-neutral-500 hover:bg-neutral-900"
+          }`}
+        >
+          <RemoteIcon className="h-7 w-7 fill-current md:h-8 md:w-8" />
+          <span className="text-[10px] font-bold">Remote</span>
+        </button>
       </nav>
 
       <main className="relative min-w-0 flex-1">
+        {/* remote-connected banner on phone */}
+        {remote.mode === "remote" && (
+          <div className="absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded-full bg-blue-600/90 px-4 py-1.5 text-xs font-bold shadow-lg">
+            Controlling car {remote.code}
+          </div>
+        )}
         <div className={tab === "yt" ? "h-full" : "hidden"}>
           <YouTubeTab />
         </div>
         <div className={tab === "music" ? "h-full" : "hidden"}>
           <MusicTab />
         </div>
+        {showRemote && <RemotePanel onClose={() => setShowRemote(false)} />}
       </main>
     </div>
+  );
+}
+
+export default function Home() {
+  return (
+    <RemoteProvider>
+      <Shell />
+    </RemoteProvider>
   );
 }
