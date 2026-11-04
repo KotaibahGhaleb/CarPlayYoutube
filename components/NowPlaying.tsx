@@ -133,7 +133,7 @@ export default function NowPlaying({
       {/* main: big art (left) + karaoke lyrics (right) */}
       <div className="flex min-h-0 flex-1 items-stretch gap-8 px-6 md:gap-12 md:px-12">
         {/* album art column — big on car screens, hidden on phones */}
-        <div className="hidden w-64 shrink-0 flex-col justify-center gap-5 sm:flex lg:w-80">
+        <div className="hidden w-64 shrink-0 flex-col justify-center gap-5 pl-4 sm:flex lg:w-80 lg:pl-10">
           {track.art ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
