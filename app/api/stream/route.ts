@@ -24,16 +24,22 @@ interface StreamSet {
   }[];
 }
 
-function pickUrl(s: StreamSet, kind: "audio" | "video"): string | null {
+// Top-N candidate URLs per provider — if the best-quality URL is IP-bound
+// or bot-checked, the next format may still pipe fine.
+function pickUrls(
+  s: StreamSet,
+  kind: "audio" | "video",
+  n = 3
+): string[] {
   if (kind === "audio") {
     const m4a = (s.audioStreams ?? []).filter((x) =>
       /mp4|m4a|aac/i.test(x.mimeType ?? "")
     );
     const pool = m4a.length ? m4a : (s.audioStreams ?? []);
-    return pool.length
-      ? pool.reduce((a, b) => ((b.bitrate ?? 0) > (a.bitrate ?? 0) ? b : a))
-          .url
-      : null;
+    return pool
+      .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))
+      .slice(0, n)
+      .map((x) => x.url);
   }
   const progressive = (s.videoStreams ?? []).filter(
     (x) => x.videoOnly === false && /^\d+p$/.test(x.quality ?? "")
@@ -41,12 +47,12 @@ function pickUrl(s: StreamSet, kind: "audio" | "video"): string | null {
   const pool = progressive.length
     ? progressive
     : (s.videoStreams ?? []).filter((x) => x.videoOnly === false);
-  if (!pool.length) return null;
   const res = (x: { quality?: string }) => parseInt(x.quality ?? "") || 0;
   const under = pool.filter((x) => res(x) <= 1080);
-  return (under.length ? under : pool).reduce((a, b) =>
-    res(b) > res(a) ? b : a
-  ).url;
+  return (under.length ? under : pool)
+    .sort((a, b) => res(b) - res(a))
+    .slice(0, n)
+    .map((x) => x.url);
 }
 
 // Resolve each provider CONCURRENTLY — the first URL that actually delivers
@@ -58,11 +64,11 @@ async function resolveOne(
   kind: "audio" | "video",
   src: string,
   resolveFn: () => Promise<StreamSet>
-): Promise<{ url: string; src: string }> {
+): Promise<{ urls: string[]; src: string }> {
   const d = await resolveFn();
-  const u = pickUrl(d, kind);
-  if (!u) throw new Error(`${src}: no usable stream`);
-  return { url: u, src };
+  const urls = pickUrls(d, kind, 3);
+  if (!urls.length) throw new Error(`${src}: no usable stream`);
+  return { urls, src };
 }
 
 // Per-warm-instance cache of WORKING upstream URLs — skips resolution + probe
@@ -225,11 +231,17 @@ export async function GET(req: NextRequest) {
                 getInvidiousStreams(videoId)
               ),
           ].map(async (job) => {
-            const { url, src } = await job();
-            const r = await pipeUpstream(url, range);
-            if (!r) throw new Error(`${src} probe failed`);
-            cacheUrl(videoId, kind, url);
-            return r;
+            const { urls, src } = await job();
+            // try each candidate URL — a blocked format doesn't sink the
+            // whole provider
+            for (const url of urls) {
+              const r = await pipeUpstream(url, range);
+              if (r) {
+                cacheUrl(videoId, kind, url);
+                return r;
+              }
+            }
+            throw new Error(`${src}: all candidate URLs failed`);
           })
         ),
         timeout,

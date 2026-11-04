@@ -35,7 +35,8 @@ const CLIENT = {
 };
 
 // Client identities tried in order — YouTube bot-checks different clients
-// independently, and ANDROID_VR often slips through when ANDROID is flagged.
+// independently, and the embedded/VR clients often slip through restrictions
+// that flag ANDROID (esp. commercial music videos from datacenter IPs).
 const PLAYER_CLIENTS = [
   {
     client: {
@@ -44,6 +45,15 @@ const PLAYER_CLIENTS = [
       androidSdkVersion: 30,
     },
     ua: CLIENT.ua,
+  },
+  {
+    client: {
+      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+      clientVersion: "2.0",
+      clientScreen: "EMBED",
+    },
+    ua: "Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15",
+    thirdParty: { embedUrl: "https://www.youtube.com/" },
   },
   {
     client: {
@@ -73,7 +83,10 @@ async function playerCall(videoId: string): Promise<YTPlayerResponse> {
             "User-Agent": c.ua,
           },
           body: JSON.stringify({
-            context: { client: { ...c.client, hl: "en", gl: "US" } },
+            context: {
+              client: { ...c.client, hl: "en", gl: "US" },
+              ...("thirdParty" in c ? { thirdParty: c.thirdParty } : {}),
+            },
             videoId,
           }),
         }
