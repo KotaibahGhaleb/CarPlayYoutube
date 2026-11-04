@@ -49,33 +49,32 @@ function pickUrl(s: StreamSet, kind: "audio" | "video"): string | null {
   ).url;
 }
 
-// Candidate providers. Innertube first: its URLs are IP-bound, and since we
-// resolve + fetch in the same invocation the binding stays valid. Piped/
-// Invidious may hand out direct googlevideo URLs bound to THEIR IPs — those
-// get weeded out when we actually try fetching them.
-async function* streamCandidates(videoId: string, kind: "audio" | "video") {
-  try {
-    const d = await getInnertubeStreams(videoId);
-    const u = pickUrl(d, kind);
-    if (u) yield { url: u, src: "innertube" };
-  } catch {}
-  try {
-    const d = await pipedFetch<StreamSet>(
-      `/streams/${videoId}`,
-      7000,
-      (x) =>
-        !!x &&
-        ((x.audioStreams?.length ?? 0) > 0 ||
-          (x.videoStreams?.length ?? 0) > 0)
-    );
-    const u = pickUrl(d, kind);
-    if (u) yield { url: u, src: "piped" };
-  } catch {}
-  try {
-    const d = await getInvidiousStreams(videoId);
-    const u = pickUrl(d, kind);
-    if (u) yield { url: u, src: "invidious" };
-  } catch {}
+// Resolve each provider CONCURRENTLY — the first URL that actually delivers
+// bytes wins. Innertube usually answers in <1s; if it's bot-blocked, Piped/
+// Invidious racing in parallel still beats waiting for them sequentially.
+// (Piped/Invidious URLs may be bound to THEIR IPs — the probe weeds those out.)
+async function resolveOne(
+  videoId: string,
+  kind: "audio" | "video",
+  src: string,
+  resolveFn: () => Promise<StreamSet>
+): Promise<{ url: string; src: string }> {
+  const d = await resolveFn();
+  const u = pickUrl(d, kind);
+  if (!u) throw new Error(`${src}: no usable stream`);
+  return { url: u, src };
+}
+
+// Per-warm-instance cache of WORKING upstream URLs — skips resolution + probe
+// entirely on repeats (signed URLs live ~6h; we keep them 5 min to be safe)
+const urlCache = new Map<string, { url: string; exp: number }>();
+function cachedUrl(videoId: string, kind: string): string | null {
+  const c = urlCache.get(`${videoId}:${kind}`);
+  return c && c.exp > Date.now() ? c.url : null;
+}
+function cacheUrl(videoId: string, kind: string, url: string) {
+  if (urlCache.size > 200) urlCache.clear();
+  urlCache.set(`${videoId}:${kind}`, { url, exp: Date.now() + 5 * 60 * 1000 });
 }
 
 async function pipeUpstream(url: string, range: string | null) {
@@ -128,23 +127,59 @@ export async function GET(req: NextRequest) {
   const videoId = sp.get("v");
   const range = req.headers.get("range");
 
-  // Mode 1: resolve + stream in one invocation. Try each provider's URL
-  // until one actually delivers bytes — signed URLs bound to a foreign IP
-  // fail the probe and get skipped automatically.
+  // Mode 1: resolve + stream in one invocation. Cache hits skip everything;
+  // misses race all providers concurrently and probe each URL as it lands —
+  // the first one that yields bytes wins.
   if (videoId) {
     if (!/^[A-Za-z0-9_-]{6,15}$/.test(videoId)) {
       return NextResponse.json({ error: "Invalid video id" }, { status: 400 });
     }
     const kind = sp.get("kind") === "video" ? "video" : "audio";
-    for await (const { url, src } of streamCandidates(videoId, kind)) {
-      const res = await pipeUpstream(url, range);
+
+    const hit = cachedUrl(videoId, kind);
+    if (hit) {
+      const res = await pipeUpstream(hit, range);
       if (res) return res;
-      console.warn(`[stream] ${src} candidate failed for ${videoId}`);
+      urlCache.delete(`${videoId}:${kind}`);
     }
-    return NextResponse.json(
-      { error: "No playable stream found" },
-      { status: 502 }
-    );
+
+    try {
+      const res = await Promise.any(
+        [
+          () =>
+            resolveOne(videoId, kind, "innertube", () =>
+              getInnertubeStreams(videoId)
+            ),
+          () =>
+            resolveOne(videoId, kind, "piped", () =>
+              pipedFetch<StreamSet>(
+                `/streams/${videoId}`,
+                7000,
+                (x) =>
+                  !!x &&
+                  ((x.audioStreams?.length ?? 0) > 0 ||
+                    (x.videoStreams?.length ?? 0) > 0)
+              )
+            ),
+          () =>
+            resolveOne(videoId, kind, "invidious", () =>
+              getInvidiousStreams(videoId)
+            ),
+        ].map(async (job) => {
+          const { url, src } = await job();
+          const r = await pipeUpstream(url, range);
+          if (!r) throw new Error(`${src} probe failed`);
+          cacheUrl(videoId, kind, url);
+          return r;
+        })
+      );
+      return res;
+    } catch {
+      return NextResponse.json(
+        { error: "No playable stream found" },
+        { status: 502 }
+      );
+    }
   }
 
   // Mode 2: passthrough proxy (thumbnails etc.)
