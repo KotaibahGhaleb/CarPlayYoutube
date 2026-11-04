@@ -234,6 +234,20 @@ export default function MusicTab() {
       // between lookup and playback (was the biggest latency source).
       const q = cached ? "" : `${song.name} ${song.artist}`;
       pendingQueryRef.current = q;
+      // Prefetch the videoId in parallel — if extraction fails (protected
+      // music videos are bot-checked on datacenter IPs), the iframe
+      // fallback can start instantly instead of another full cycle.
+      if (q) {
+        void fetch(`/api/stream?q=${encodeURIComponent(q)}&meta=1`)
+          .then((r) => r.json())
+          .then((b: { videoId?: string }) => {
+            if (b?.videoId && req === reqRef.current) {
+              videoIdRef.current = b.videoId;
+              vidCache.current.set(song.id, b.videoId);
+            }
+          })
+          .catch(() => {});
+      }
       if (el) {
         el.src = cached
           ? `/api/stream?v=${cached}&kind=audio`
@@ -748,7 +762,14 @@ export default function MusicTab() {
           // Signed stream URLs can expire/rate-limit — retry once (cheap:
           // caches make it near-instant), then fall back to official player
           const q = queueRef.current;
-          if (q && retriedRef.current !== q.songs[q.index]?.id) {
+          // v-mode retry is cheap (videoId cached); q-mode failures mean
+          // extraction is blocked — go straight to the fallback path
+          if (
+            q &&
+            videoIdRef.current &&
+            !pendingQueryRef.current &&
+            retriedRef.current !== q.songs[q.index]?.id
+          ) {
             retriedRef.current = q.songs[q.index].id;
             playAtRef.current?.(q.songs, q.index);
           } else if (videoIdRef.current) {
