@@ -45,6 +45,22 @@ body {
   transform: scaleY(0.25);
 }
 
+/* Fade the lyric list at top and bottom — Apple Music look */
+.lyrics-fade {
+  -webkit-mask-image: linear-gradient(
+    transparent,
+    black 18%,
+    black 82%,
+    transparent
+  );
+  mask-image: linear-gradient(
+    transparent,
+    black 18%,
+    black 82%,
+    transparent
+  );
+}
+
 /* Lyric line transitions */
 .lyric-line {
   transition:
