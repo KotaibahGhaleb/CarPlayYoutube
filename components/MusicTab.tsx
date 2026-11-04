@@ -1,0 +1,532 @@
+"use client";
+
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  bestAudioStream,
+  extractVideoId,
+  getStreams,
+  mediaUrl,
+  searchYouTube,
+} from "@/lib/piped";
+import { getLyrics, type LyricsResult } from "@/lib/lyrics";
+import {
+  addPlaylist,
+  getFavorites,
+  getPlaylistSongs,
+  getSavedPlaylists,
+  playlistIdFromUrl,
+  removePlaylist,
+  searchSongs,
+  toggleFavorite,
+  topSongs,
+  type SavedPlaylist,
+  type Song,
+} from "@/lib/music";
+import NowPlaying from "./NowPlaying";
+
+function fmtDur(ms?: number) {
+  if (!ms) return "";
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
+}
+
+function Heart({ filled }: { filled: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className={`h-5 w-5 ${
+        filled ? "fill-green-500" : "fill-none stroke-neutral-500 stroke-2"
+      }`}
+    >
+      <path d="M12 21s-7.5-4.9-9.9-9.2C.4 8.6 2.3 5 5.7 5c2 0 3.4 1.1 4.3 2.6h4c.9-1.5 2.3-2.6 4.3-2.6 3.4 0 5.3 3.6 3.6 6.8C19.5 16.1 12 21 12 21Z" />
+    </svg>
+  );
+}
+
+export default function MusicTab() {
+  const [listTitle, setListTitle] = useState("Top Songs");
+  const [songs, setSongs] = useState<Song[]>([]);
+  const [loadingList, setLoadingList] = useState(false);
+  const [listError, setListError] = useState("");
+  const [searchQ, setSearchQ] = useState("");
+  const [favs, setFavs] = useState<Song[]>([]);
+  const [playlists, setPlaylists] = useState<SavedPlaylist[]>([]);
+  const [plInput, setPlInput] = useState("");
+  const [plError, setPlError] = useState("");
+
+  // playback
+  const [queue, setQueue] = useState<{ songs: Song[]; index: number } | null>(
+    null
+  );
+  const [showNow, setShowNow] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [streamError, setStreamError] = useState("");
+  const [lyrics, setLyrics] = useState<LyricsResult | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [time, setTime] = useState(0);
+  const [dur, setDur] = useState(0);
+
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const reqRef = useRef(0);
+  const retriedRef = useRef<string | null>(null);
+
+  const current = queue ? queue.songs[queue.index] : null;
+
+  // ---- list loaders ----
+  const showTop = useCallback(async () => {
+    setLoadingList(true);
+    setListError("");
+    try {
+      const s = await topSongs();
+      setSongs(s);
+      setListTitle("Top Songs");
+    } catch (e) {
+      setListError(
+        `Couldn't load charts${e instanceof Error ? ` — ${e.message}` : ""}`
+      );
+    } finally {
+      setLoadingList(false);
+    }
+  }, []);
+
+  const showFavs = useCallback(() => {
+    setFavs(getFavorites());
+    setSongs(getFavorites());
+    setListTitle("Favorites");
+  }, []);
+
+  useEffect(() => {
+    setPlaylists(getSavedPlaylists());
+    setFavs(getFavorites());
+    showTop();
+  }, [showTop]);
+
+  async function openPlaylist(p: SavedPlaylist) {
+    setLoadingList(true);
+    setListError("");
+    try {
+      const { name, songs } = await getPlaylistSongs(p.id);
+      setSongs(songs);
+      setListTitle(name);
+    } catch (e) {
+      setListError(
+        `Couldn't load playlist${e instanceof Error ? ` — ${e.message}` : ""}`
+      );
+    } finally {
+      setLoadingList(false);
+    }
+  }
+
+  async function onImport(e: FormEvent) {
+    e.preventDefault();
+    const id = playlistIdFromUrl(plInput);
+    if (!id) {
+      setPlError("Paste a YouTube playlist link");
+      return;
+    }
+    setPlError("");
+    setLoadingList(true);
+    try {
+      const { name, songs } = await getPlaylistSongs(id);
+      if (!songs.length) throw new Error("empty playlist");
+      setPlaylists(addPlaylist(id, name));
+      setSongs(songs);
+      setListTitle(name);
+      setPlInput("");
+    } catch {
+      setPlError("Couldn't read that playlist — is it public/unlisted?");
+    } finally {
+      setLoadingList(false);
+    }
+  }
+
+  async function onSearch(e: FormEvent) {
+    e.preventDefault();
+    if (!searchQ.trim()) return;
+    setLoadingList(true);
+    setListError("");
+    try {
+      setSongs(await searchSongs(searchQ.trim()));
+      setListTitle(`Results for "${searchQ.trim()}"`);
+    } catch (e) {
+      setListError(
+        `Search failed${e instanceof Error ? ` — ${e.message}` : ""}`
+      );
+    } finally {
+      setLoadingList(false);
+    }
+  }
+
+  // ---- playback ----
+  const playAt = useCallback(async (list: Song[], index: number) => {
+    const song = list[index];
+    if (!song) return;
+    const req = ++reqRef.current;
+    setQueue({ songs: list, index });
+    setShowNow(true);
+    setResolving(true);
+    setStreamError("");
+    setLyrics(null);
+    setTime(0);
+
+    const lyricsPromise = getLyrics({
+      track: song.name,
+      artist: song.artist,
+      album: song.album,
+      duration: (song.durationMs ?? 0) / 1000,
+    });
+
+    try {
+      let videoId = song.youtubeId;
+      if (!videoId) {
+        const items = await searchYouTube(
+          `${song.name} ${song.artist}`,
+          "music_songs"
+        );
+        if (req !== reqRef.current) return;
+        if (!items.length) throw new Error("no match");
+        const target = (song.durationMs ?? 0) / 1000;
+        videoId = extractVideoId(
+          (target
+            ? items.reduce((a, b) =>
+                Math.abs(b.duration - target) < Math.abs(a.duration - target)
+                  ? b
+                  : a
+              )
+            : items[0]
+          ).url
+        );
+      }
+      const streams = await getStreams(videoId);
+      if (req !== reqRef.current) return;
+      const audio =
+        bestAudioStream(streams.audioStreams) ??
+        streams.videoStreams
+          ?.filter((s) => s.videoOnly === false && /^\d+p$/.test(s.quality))
+          .sort(
+            (a, b) => (parseInt(a.quality) || 0) - (parseInt(b.quality) || 0)
+          )[0];
+      if (!audio) throw new Error("no audio stream");
+
+      const el = audioRef.current;
+      if (el) {
+        el.src = mediaUrl(audio.url)!;
+        await el.play().catch(() => {});
+      }
+    } catch (e) {
+      if (req === reqRef.current)
+        setStreamError(
+          `Couldn't play this song${
+            e instanceof Error ? ` — ${e.message}` : ""
+          }`
+        );
+    } finally {
+      if (req === reqRef.current) setResolving(false);
+    }
+
+    const l = await lyricsPromise;
+    if (req === reqRef.current) setLyrics(l);
+  }, []);
+
+  const next = useCallback(() => {
+    if (!queue) return;
+    playAt(queue.songs, (queue.index + 1) % queue.songs.length);
+  }, [queue, playAt]);
+
+  const prev = useCallback(() => {
+    const el = audioRef.current;
+    if (el && el.currentTime > 3 && queue) {
+      el.currentTime = 0;
+      return;
+    }
+    if (!queue) return;
+    playAt(
+      queue.songs,
+      (queue.index - 1 + queue.songs.length) % queue.songs.length
+    );
+  }, [queue, playAt]);
+
+  const toggle = useCallback(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (el.paused) el.play().catch(() => {});
+    else el.pause();
+  }, []);
+
+  // media session — car/lock-screen controls
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !current) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: current.name,
+      artist: current.artist,
+      album: current.album ?? "",
+      artwork: current.art
+        ? [{ src: current.art, sizes: "600x600", type: "image/jpeg" }]
+        : [],
+    });
+    navigator.mediaSession.setActionHandler("play", toggle);
+    navigator.mediaSession.setActionHandler("pause", toggle);
+    navigator.mediaSession.setActionHandler("nexttrack", next);
+    navigator.mediaSession.setActionHandler("previoustrack", prev);
+  }, [current, toggle, next, prev]);
+
+  // ---- render ----
+  return (
+    <div className="relative flex h-full">
+      {/* sidebar */}
+      <aside className="flex w-60 shrink-0 flex-col border-r border-neutral-800 md:w-72">
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+          <button
+            onClick={showTop}
+            className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+          >
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-orange-500 to-red-500 text-xl">
+              ♫
+            </span>
+            <span className="block truncate text-sm font-bold">Top Songs</span>
+          </button>
+          <button
+            onClick={showFavs}
+            className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+          >
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-purple-400 text-xl">
+              ♥
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-bold">
+                Favorites
+              </span>
+              <span className="text-xs text-neutral-500">
+                {favs.length} songs
+              </span>
+            </span>
+          </button>
+
+          {playlists.length > 0 && (
+            <p className="mb-1 mt-4 px-2 text-xs font-bold uppercase tracking-wider text-neutral-500">
+              Your playlists
+            </p>
+          )}
+          {playlists.map((p) => (
+            <div key={p.id} className="group mb-1 flex items-center">
+              <button
+                onClick={() => openPlaylist(p)}
+                className="flex min-w-0 flex-1 items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+              >
+                <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-lg">
+                  ▶
+                </span>
+                <span className="block min-w-0 truncate text-sm font-semibold">
+                  {p.name}
+                </span>
+              </button>
+              <button
+                onClick={() => setPlaylists(removePlaylist(p.id))}
+                className="shrink-0 rounded-full p-2 text-neutral-600 opacity-0 transition group-hover:opacity-100 hover:text-red-400"
+                aria-label="Remove playlist"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+
+        {/* playlist import */}
+        <form
+          onSubmit={onImport}
+          className="shrink-0 border-t border-neutral-800 p-3"
+        >
+          <input
+            value={plInput}
+            onChange={(e) => setPlInput(e.target.value)}
+            placeholder="Paste YouTube playlist link…"
+            className="h-11 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 text-xs outline-none placeholder:text-neutral-600 focus:border-green-600"
+          />
+          {plError && (
+            <p className="mt-1.5 text-xs leading-snug text-red-400">{plError}</p>
+          )}
+        </form>
+      </aside>
+
+      {/* main */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <form onSubmit={onSearch} className="flex shrink-0 gap-3 p-4 pb-2">
+          <input
+            value={searchQ}
+            onChange={(e) => setSearchQ(e.target.value)}
+            placeholder="Search songs…"
+            className="h-12 min-w-0 flex-1 rounded-2xl border border-neutral-800 bg-neutral-900 px-5 outline-none placeholder:text-neutral-500 focus:border-green-600"
+          />
+        </form>
+        <p className="shrink-0 px-5 pb-1 text-xs font-bold uppercase tracking-wider text-neutral-500">
+          {listTitle}
+        </p>
+        {listError && (
+          <p className="shrink-0 px-5 pb-1 text-sm text-red-400">{listError}</p>
+        )}
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
+          {loadingList ? (
+            <p className="p-4 text-neutral-500">Loading…</p>
+          ) : songs.length === 0 ? (
+            <p className="p-4 text-neutral-600">
+              {listTitle === "Favorites"
+                ? "No favorites yet — tap ♥ on any song"
+                : "Nothing here"}
+            </p>
+          ) : (
+            songs.map((s, i) => {
+              const isCurrent = current?.id === s.id;
+              const isFav = favs.some((f) => f.id === s.id);
+              return (
+                <div
+                  key={`${s.id}-${i}`}
+                  className={`flex w-full items-center gap-3 rounded-xl p-2.5 text-left transition ${
+                    isCurrent ? "bg-neutral-900" : "hover:bg-neutral-900/70"
+                  }`}
+                >
+                  <button
+                    onClick={() => playAt(songs, i)}
+                    className="flex min-w-0 flex-1 items-center gap-3 text-left active:scale-95"
+                  >
+                    {s.art ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={s.art}
+                        alt=""
+                        className="h-12 w-12 shrink-0 rounded-lg object-cover"
+                      />
+                    ) : (
+                      <span className="h-12 w-12 shrink-0 rounded-lg bg-neutral-800" />
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span
+                        className={`block truncate text-sm font-semibold ${
+                          isCurrent ? "text-green-400" : ""
+                        }`}
+                      >
+                        {s.name}
+                      </span>
+                      <span className="block truncate text-xs text-neutral-400">
+                        {s.artist}
+                      </span>
+                    </span>
+                    {isCurrent && playing && (
+                      <span className="flex items-end gap-0.5 pr-1">
+                        {[0, 1, 2].map((j) => (
+                          <span
+                            key={j}
+                            className="eq-bar inline-block w-0.5 rounded-full bg-green-500"
+                            style={{
+                              height: `${8 + j * 4}px`,
+                              animationDelay: `${j * 0.2}s`,
+                            }}
+                          />
+                        ))}
+                      </span>
+                    )}
+                    <span className="shrink-0 text-xs tabular-nums text-neutral-500">
+                      {fmtDur(s.durationMs)}
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => setFavs(toggleFavorite(s))}
+                    className="shrink-0 rounded-full p-2 hover:bg-neutral-800"
+                    aria-label="Favorite"
+                  >
+                    <Heart filled={isFav} />
+                  </button>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {/* mini player bar */}
+      {current && !showNow && (
+        <button
+          onClick={() => setShowNow(true)}
+          className="absolute bottom-3 left-1/2 z-40 flex w-[calc(100%-2rem)] max-w-xl -translate-x-1/2 items-center gap-3 rounded-2xl border border-neutral-700 bg-neutral-900/95 p-2.5 text-left shadow-xl backdrop-blur"
+        >
+          {current.art && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={current.art}
+              alt=""
+              className="h-11 w-11 rounded-lg object-cover"
+            />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-bold">
+              {current.name}
+            </span>
+            <span className="block truncate text-xs text-neutral-400">
+              {current.artist}
+            </span>
+          </span>
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              toggle();
+            }}
+            onKeyDown={(e) => e.key === "Enter" && toggle()}
+            className="flex h-11 w-11 items-center justify-center rounded-full bg-white text-black"
+          >
+            {playing ? (
+              <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
+                <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" className="ml-0.5 h-5 w-5 fill-current">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            )}
+          </span>
+        </button>
+      )}
+
+      {/* full now-playing */}
+      {showNow && current && (
+        <NowPlaying
+          track={current}
+          playing={playing}
+          time={time}
+          dur={dur}
+          lyrics={lyrics}
+          resolving={resolving}
+          streamError={streamError}
+          onToggle={toggle}
+          onNext={next}
+          onPrev={prev}
+          onSeek={(t) => {
+            if (audioRef.current) audioRef.current.currentTime = t;
+            setTime(t);
+          }}
+          onClose={() => setShowNow(false)}
+        />
+      )}
+
+      <audio
+        ref={audioRef}
+        className="hidden"
+        onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => setDur(e.currentTarget.duration)}
+        onDurationChange={(e) => setDur(e.currentTarget.duration)}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={next}
+        onError={() => {
+          // Signed stream URLs can expire/rate-limit — regenerate once
+          if (queue && retriedRef.current !== queue.songs[queue.index]?.id) {
+            retriedRef.current = queue.songs[queue.index].id;
+            playAt(queue.songs, queue.index);
+          } else {
+            setStreamError("Playback failed — try another song");
+          }
+        }}
+      />
+    </div>
+  );
+}
