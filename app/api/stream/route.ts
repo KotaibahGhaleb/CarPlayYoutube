@@ -49,10 +49,16 @@ function pickUrl(s: StreamSet, kind: "audio" | "video"): string | null {
   ).url;
 }
 
-async function resolveStreamUrl(
-  videoId: string,
-  kind: "audio" | "video"
-): Promise<string> {
+// Candidate providers. Innertube first: its URLs are IP-bound, and since we
+// resolve + fetch in the same invocation the binding stays valid. Piped/
+// Invidious may hand out direct googlevideo URLs bound to THEIR IPs — those
+// get weeded out when we actually try fetching them.
+async function* streamCandidates(videoId: string, kind: "audio" | "video") {
+  try {
+    const d = await getInnertubeStreams(videoId);
+    const u = pickUrl(d, kind);
+    if (u) yield { url: u, src: "innertube" };
+  } catch {}
   try {
     const d = await pipedFetch<StreamSet>(
       `/streams/${videoId}`,
@@ -63,17 +69,13 @@ async function resolveStreamUrl(
           (x.videoStreams?.length ?? 0) > 0)
     );
     const u = pickUrl(d, kind);
-    if (u) return u;
+    if (u) yield { url: u, src: "piped" };
   } catch {}
   try {
     const d = await getInvidiousStreams(videoId);
     const u = pickUrl(d, kind);
-    if (u) return u;
+    if (u) yield { url: u, src: "invidious" };
   } catch {}
-  const d = await getInnertubeStreams(videoId);
-  const u = pickUrl(d, kind);
-  if (!u) throw new Error("No playable stream found");
-  return u;
 }
 
 async function pipeUpstream(url: string, range: string | null) {
@@ -81,39 +83,24 @@ async function pipeUpstream(url: string, range: string | null) {
   if (range) headers.range = range;
 
   let upstream: Response | null = null;
-  let fetchErr: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
       upstream = await fetch(url, {
         headers,
         redirect: "follow",
         signal: AbortSignal.timeout(30000),
       });
-      if (
-        upstream.ok ||
-        upstream.status === 206 ||
-        (upstream.status !== 403 && upstream.status !== 429)
-      )
-        break;
+      if (upstream.ok || upstream.status === 206) break;
       upstream = null;
-      await new Promise((r) => setTimeout(r, 400));
-    } catch (e) {
-      fetchErr = e;
-      await new Promise((r) => setTimeout(r, 400));
+      break; // definite rejection — don't retry this URL
+    } catch {
+      upstream = null;
+      await new Promise((r) => setTimeout(r, 300));
     }
   }
 
-  if (!upstream) {
-    return NextResponse.json(
-      { error: fetchErr instanceof Error ? fetchErr.message : "Upstream failed" },
-      { status: 502 }
-    );
-  }
-  if (!upstream.ok && upstream.status !== 206) {
-    return NextResponse.json(
-      { error: `Upstream ${upstream.status}` },
-      { status: 502 }
-    );
+  if (!upstream || (!upstream.ok && upstream.status !== 206)) {
+    return null;
   }
 
   const pass = [
@@ -141,22 +128,23 @@ export async function GET(req: NextRequest) {
   const videoId = sp.get("v");
   const range = req.headers.get("range");
 
-  // Mode 1: resolve + stream in one invocation
+  // Mode 1: resolve + stream in one invocation. Try each provider's URL
+  // until one actually delivers bytes — signed URLs bound to a foreign IP
+  // fail the probe and get skipped automatically.
   if (videoId) {
     if (!/^[A-Za-z0-9_-]{6,15}$/.test(videoId)) {
       return NextResponse.json({ error: "Invalid video id" }, { status: 400 });
     }
     const kind = sp.get("kind") === "video" ? "video" : "audio";
-    let url: string;
-    try {
-      url = await resolveStreamUrl(videoId, kind);
-    } catch (e) {
-      return NextResponse.json(
-        { error: e instanceof Error ? e.message : "Resolve failed" },
-        { status: 502 }
-      );
+    for await (const { url, src } of streamCandidates(videoId, kind)) {
+      const res = await pipeUpstream(url, range);
+      if (res) return res;
+      console.warn(`[stream] ${src} candidate failed for ${videoId}`);
     }
-    return pipeUpstream(url, range);
+    return NextResponse.json(
+      { error: "No playable stream found" },
+      { status: 502 }
+    );
   }
 
   // Mode 2: passthrough proxy (thumbnails etc.)
@@ -173,5 +161,9 @@ export async function GET(req: NextRequest) {
   if (!ALLOWED_HOST.test(host)) {
     return NextResponse.json({ error: "Host not allowed" }, { status: 403 });
   }
-  return pipeUpstream(url, range);
+  const res = await pipeUpstream(url, range);
+  return (
+    res ??
+    NextResponse.json({ error: "Upstream failed" }, { status: 502 })
+  );
 }
