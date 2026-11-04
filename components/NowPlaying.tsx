@@ -84,6 +84,12 @@ export default function NowPlaying({
         </div>
       </div>
 
+      {/* mobile track info — art column is hidden on phones */}
+      <div className="shrink-0 px-6 pb-1 text-center sm:hidden">
+        <h2 className="line-clamp-1 text-lg font-bold">{track.name}</h2>
+        <p className="truncate text-sm text-neutral-400">{track.artist}</p>
+      </div>
+
       {/* main: art + lyrics */}
       <div className="flex min-h-0 flex-1 items-center gap-6 px-6 md:gap-10 md:px-10">
         <div className="hidden w-56 shrink-0 flex-col gap-4 sm:flex md:w-72">
@@ -110,7 +116,7 @@ export default function NowPlaying({
         {/* lyrics */}
         <div
           ref={scrollRef}
-          className="scrollbar-hide min-h-0 flex-1 overflow-y-auto py-[30vh] text-center"
+          className="scrollbar-hide min-h-0 flex-1 overflow-y-auto py-[20vh] text-center md:py-[30vh]"
         >
           {resolving ? (
             <p className="text-xl font-semibold text-neutral-500">

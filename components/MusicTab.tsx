@@ -432,8 +432,8 @@ export default function MusicTab() {
   // ---- render ----
   return (
     <div className="relative flex h-full">
-      {/* sidebar */}
-      <aside className="flex w-60 shrink-0 flex-col border-r border-neutral-800 md:w-72">
+      {/* sidebar — hidden on phones, replaced by the horizontal strip below */}
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-neutral-800 md:flex md:w-72">
         <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
           <button
             onClick={showTop}
@@ -509,7 +509,7 @@ export default function MusicTab() {
 
       {/* main */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <form onSubmit={onSearch} className="flex shrink-0 gap-3 p-4 pb-2">
+        <form onSubmit={onSearch} className="flex shrink-0 gap-3 p-3 pb-2 md:p-4 md:pb-2">
           <input
             value={searchQ}
             onChange={(e) => setSearchQ(e.target.value)}
@@ -517,6 +517,31 @@ export default function MusicTab() {
             className="h-12 min-w-0 flex-1 rounded-2xl border border-neutral-800 bg-neutral-900 px-5 outline-none placeholder:text-neutral-500 focus:border-green-600"
           />
         </form>
+
+        {/* mobile library strip — phones only */}
+        <div className="scrollbar-hide flex shrink-0 gap-2 overflow-x-auto px-3 pb-2 md:hidden">
+          <button
+            onClick={showTop}
+            className="flex shrink-0 items-center gap-1.5 rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+          >
+            ♫ Top
+          </button>
+          <button
+            onClick={showFavs}
+            className="flex shrink-0 items-center gap-1.5 rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+          >
+            ♥ Favs
+          </button>
+          {playlists.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => openPlaylist(p)}
+              className="flex shrink-0 items-center rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
         <p className="shrink-0 px-5 pb-1 text-xs font-bold uppercase tracking-wider text-neutral-500">
           {listTitle}
         </p>

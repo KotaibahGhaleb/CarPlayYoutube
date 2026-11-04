@@ -12,7 +12,7 @@ export default function RemotePanel({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="absolute inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="w-full max-w-sm rounded-3xl border border-neutral-800 bg-neutral-900 p-6">
+      <div className="mx-4 w-full max-w-sm rounded-3xl border border-neutral-800 bg-neutral-900 p-6">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-bold">Remote Control</h2>
           <button

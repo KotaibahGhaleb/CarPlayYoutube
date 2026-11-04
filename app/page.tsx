@@ -50,12 +50,12 @@ function Shell() {
   };
 
   return (
-    <div className="flex h-dvh">
-      {/* CarPlay-style dock */}
-      <nav className="flex w-20 shrink-0 flex-col items-center gap-3 border-r border-neutral-800 bg-neutral-950 py-4 md:w-24">
+    <div className="flex h-dvh flex-col md:flex-row">
+      {/* CarPlay-style dock — side rail on wide screens, bottom bar on phones */}
+      <nav className="order-2 flex shrink-0 flex-row items-center justify-around gap-1 border-t border-neutral-800 bg-neutral-950 px-2 pb-[env(safe-area-inset-bottom)] pt-1.5 md:order-none md:w-24 md:flex-col md:justify-start md:gap-3 md:border-r md:border-t-0 md:px-0 md:py-4">
         <button
           onClick={() => switchTab("yt")}
-          className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-2xl transition active:scale-90 md:h-20 md:w-20 ${
+          className={`flex h-14 w-20 flex-col items-center justify-center gap-0.5 rounded-2xl transition active:scale-90 md:h-20 md:w-20 md:gap-1 ${
             tab === "yt"
               ? "bg-red-600/20 text-red-500"
               : "text-neutral-500 hover:bg-neutral-900"
@@ -66,7 +66,7 @@ function Shell() {
         </button>
         <button
           onClick={() => switchTab("music")}
-          className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-2xl transition active:scale-90 md:h-20 md:w-20 ${
+          className={`flex h-14 w-20 flex-col items-center justify-center gap-0.5 rounded-2xl transition active:scale-90 md:h-20 md:w-20 md:gap-1 ${
             tab === "music"
               ? "bg-green-600/20 text-green-500"
               : "text-neutral-500 hover:bg-neutral-900"
@@ -75,10 +75,10 @@ function Shell() {
           <MusicIcon className="h-7 w-7 fill-current md:h-8 md:w-8" />
           <span className="text-[10px] font-bold">Music</span>
         </button>
-        <div className="mt-auto" />
+        <div className="hidden md:mt-auto md:block" />
         <button
           onClick={() => setShowRemote(true)}
-          className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-2xl transition active:scale-90 md:h-20 md:w-20 ${
+          className={`flex h-14 w-20 flex-col items-center justify-center gap-0.5 rounded-2xl transition active:scale-90 md:h-20 md:w-20 md:gap-1 ${
             remote.mode !== "off"
               ? "bg-blue-600/20 text-blue-400"
               : "text-neutral-500 hover:bg-neutral-900"
@@ -89,10 +89,10 @@ function Shell() {
         </button>
       </nav>
 
-      <main className="relative min-w-0 flex-1">
+      <main className="relative order-1 min-h-0 min-w-0 flex-1 md:order-none">
         {/* remote-connected banner on phone */}
         {remote.mode === "remote" && (
-          <div className="absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded-full bg-blue-600/90 px-4 py-1.5 text-xs font-bold shadow-lg">
+          <div className="pointer-events-none absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded-full bg-blue-600/90 px-4 py-1.5 text-xs font-bold shadow-lg">
             Controlling car {remote.code}
           </div>
         )}
