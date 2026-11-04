@@ -81,6 +81,7 @@ export default function MusicTab() {
   const [dur, setDur] = useState(0);
 
   const audioRef = useRef<HTMLAudioElement>(null);
+  const vidCache = useRef(new Map<string, string>());
   const reqRef = useRef(0);
   const retriedRef = useRef<string | null>(null);
   const videoIdRef = useRef("");
@@ -225,7 +226,7 @@ export default function MusicTab() {
     });
 
     try {
-      let videoId = song.youtubeId;
+      let videoId = song.youtubeId ?? vidCache.current.get(song.id) ?? "";
       if (!videoId) {
         const items = await searchYouTube(
           `${song.name} ${song.artist}`,
@@ -244,6 +245,7 @@ export default function MusicTab() {
             : items[0]
           ).url
         );
+        vidCache.current.set(song.id, videoId);
       }
       // The proxy resolves + streams in one invocation — no signed URL
       // ever reaches the browser, so IP-binding can't break playback.

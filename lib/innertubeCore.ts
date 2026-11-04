@@ -122,3 +122,81 @@ export async function getInnertubeStreams(videoId: string) {
     relatedStreams: [],
   };
 }
+
+// Direct YouTube search — no third-party instance, ~500ms, races Piped
+// searches in the API route so song lookup doesn't wait on dead instances.
+interface YTSearchItem {
+  videoRenderer?: {
+    videoId?: string;
+    title?: { runs?: { text?: string }[] };
+    ownerText?: { runs?: { text?: string }[] };
+    lengthText?: { simpleText?: string };
+    thumbnail?: { thumbnails?: { url?: string }[] };
+  };
+}
+
+function parseDur(t?: string): number {
+  if (!t) return 0;
+  const p = t.split(":").map(Number);
+  return p.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+export async function searchInnertube(query: string) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(
+      "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
+      {
+        method: "POST",
+        signal: ctrl.signal,
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": CLIENT.ua,
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: CLIENT.clientName,
+              clientVersion: CLIENT.clientVersion,
+              androidSdkVersion: CLIENT.androidSdkVersion,
+              hl: "en",
+              gl: "US",
+            },
+          },
+          query,
+        }),
+      }
+    );
+    if (!res.ok) throw new Error(`YouTube HTTP ${res.status}`);
+    const d = (await res.json()) as {
+      contents?: {
+        sectionListRenderer?: {
+          contents?: { itemSectionRenderer?: { contents?: YTSearchItem[] } }[];
+        };
+      };
+    };
+
+    const out = [];
+    const sections = d.contents?.sectionListRenderer?.contents ?? [];
+    for (const s of sections) {
+      for (const c of s?.itemSectionRenderer?.contents ?? []) {
+        const v = c.videoRenderer;
+        if (!v?.videoId) continue;
+        const thumbs = v.thumbnail?.thumbnails ?? [];
+        out.push({
+          type: "stream",
+          url: `/watch?v=${v.videoId}`,
+          title: v.title?.runs?.[0]?.text ?? "",
+          uploaderName: v.ownerText?.runs?.[0]?.text ?? "",
+          thumbnail: thumbs[thumbs.length - 1]?.url ?? "",
+          duration: parseDur(v.lengthText?.simpleText),
+        });
+      }
+    }
+    if (!out.length) throw new Error("YouTube search returned no results");
+    return out;
+  } finally {
+    clearTimeout(t);
+  }
+}

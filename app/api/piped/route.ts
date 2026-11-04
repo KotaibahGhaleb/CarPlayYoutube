@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pipedFetch } from "@/lib/pipedCore";
 import { getInvidiousStreams } from "@/lib/invidiousCore";
-import { getInnertubeStreams } from "@/lib/innertubeCore";
+import { getInnertubeStreams, searchInnertube } from "@/lib/innertubeCore";
 
 export const maxDuration = 60;
 
@@ -36,7 +36,20 @@ export async function GET(req: NextRequest) {
       }
     : undefined;
 
+  const isSearch = path.startsWith("/search");
+
   try {
+    // For searches, race Piped against a direct YouTube search — dead
+    // instances can't stall results when YouTube itself answers in ~500ms
+    if (isSearch) {
+      const q =
+        new URLSearchParams(path.slice(path.indexOf("?") + 1)).get("q") ?? "";
+      const data = await Promise.any([
+        pipedFetch(path, 7000, validate),
+        searchInnertube(q),
+      ]);
+      return NextResponse.json(data);
+    }
     const data = await pipedFetch(path, 7000, validate);
     return NextResponse.json(data);
   } catch (e) {
