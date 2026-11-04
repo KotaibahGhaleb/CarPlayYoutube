@@ -18,6 +18,24 @@ import {
 } from "@/lib/music";
 import NowPlaying from "./NowPlaying";
 
+// YouTube IFrame API — last-resort playback path. When our stream extraction
+// is completely blocked, the official player still works everywhere
+// (may occasionally play an ad, but the app never dead-ends).
+/* eslint-disable @typescript-eslint/no-explicit-any */
+let ytApiPromise: Promise<any> | null = null;
+function loadYT(): Promise<any> {
+  if (ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise((resolve) => {
+    const w = window as any;
+    if (w.YT?.Player) return resolve(w.YT);
+    const s = document.createElement("script");
+    s.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(s);
+    w.onYouTubeIframeAPIReady = () => resolve(w.YT);
+  });
+  return ytApiPromise;
+}
+
 function fmtDur(ms?: number) {
   if (!ms) return "";
   const s = Math.round(ms / 1000);
@@ -63,8 +81,29 @@ export default function MusicTab() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const reqRef = useRef(0);
   const retriedRef = useRef<string | null>(null);
+  const videoIdRef = useRef("");
+  const ytRef = useRef<any>(null);
+  const pollRef = useRef<number | null>(null);
+  const [useIframe, setUseIframe] = useState(false);
 
   const current = queue ? queue.songs[queue.index] : null;
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const playAtRef = useRef<any>(null);
+
+  const stopIframe = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    try {
+      ytRef.current?.destroy();
+    } catch {}
+    ytRef.current = null;
+  }, []);
+
+  useEffect(() => stopIframe, [stopIframe]);
 
   // ---- list loaders ----
   const showTop = useCallback(async () => {
@@ -156,6 +195,8 @@ export default function MusicTab() {
     const song = list[index];
     if (!song) return;
     const req = ++reqRef.current;
+    stopIframe();
+    setUseIframe(false);
     setQueue({ songs: list, index });
     setShowNow(true);
     setResolving(true);
@@ -195,6 +236,7 @@ export default function MusicTab() {
       // ever reaches the browser, so IP-binding can't break playback.
       const el = audioRef.current;
       if (req !== reqRef.current) return;
+      videoIdRef.current = videoId;
       if (el) {
         el.src = `/api/stream?v=${videoId}&kind=audio`;
         await el.play().catch(() => {});
@@ -212,7 +254,51 @@ export default function MusicTab() {
 
     const l = await lyricsPromise;
     if (req === reqRef.current) setLyrics(l);
-  }, []);
+  }, [stopIframe]);
+
+  playAtRef.current = playAt;
+
+  // Official YT player as last resort — when extraction is fully blocked
+  const startIframeFallback = useCallback(async () => {
+    const req = reqRef.current;
+    setStreamError("");
+    setResolving(false);
+    setUseIframe(true);
+    const YT = await loadYT();
+    if (req !== reqRef.current) return;
+    stopIframe();
+    const wrap = document.getElementById("yt-holder-wrap");
+    if (wrap) wrap.innerHTML = '<div id="yt-holder"></div>';
+    ytRef.current = new YT.Player("yt-holder", {
+      videoId: videoIdRef.current,
+      playerVars: { autoplay: 1, controls: 0, disablekb: 1 },
+      events: {
+        onReady: (e: any) => e.target.playVideo(),
+        onStateChange: (e: any) => {
+          const st = YT.PlayerState;
+          if (e.data === st.PLAYING) {
+            setPlaying(true);
+            setDur(e.target.getDuration() || 0);
+            if (pollRef.current) clearInterval(pollRef.current);
+            pollRef.current = window.setInterval(
+              () => setTime(e.target.getCurrentTime() || 0),
+              500
+            );
+          } else if (e.data === st.PAUSED) {
+            setPlaying(false);
+          } else if (e.data === st.ENDED) {
+            setPlaying(false);
+            const q = queueRef.current;
+            if (q)
+              playAtRef.current?.(
+                q.songs,
+                (q.index + 1) % q.songs.length
+              );
+          }
+        },
+      },
+    });
+  }, [stopIframe]);
 
   const next = useCallback(() => {
     if (!queue) return;
@@ -220,6 +306,13 @@ export default function MusicTab() {
   }, [queue, playAt]);
 
   const prev = useCallback(() => {
+    if (useIframe && ytRef.current) {
+      const t = ytRef.current.getCurrentTime?.() ?? 0;
+      if (t > 3) {
+        ytRef.current.seekTo(0, true);
+        return;
+      }
+    }
     const el = audioRef.current;
     if (el && el.currentTime > 3 && queue) {
       el.currentTime = 0;
@@ -230,14 +323,19 @@ export default function MusicTab() {
       queue.songs,
       (queue.index - 1 + queue.songs.length) % queue.songs.length
     );
-  }, [queue, playAt]);
+  }, [queue, playAt, useIframe]);
 
   const toggle = useCallback(() => {
+    if (useIframe && ytRef.current) {
+      if (ytRef.current.getPlayerState?.() === 1) ytRef.current.pauseVideo();
+      else ytRef.current.playVideo();
+      return;
+    }
     const el = audioRef.current;
     if (!el) return;
     if (el.paused) el.play().catch(() => {});
     else el.pause();
-  }, []);
+  }, [useIframe]);
 
   // media session — car/lock-screen controls
   useEffect(() => {
@@ -487,12 +585,22 @@ export default function MusicTab() {
           onNext={next}
           onPrev={prev}
           onSeek={(t) => {
-            if (audioRef.current) audioRef.current.currentTime = t;
+            if (useIframe && ytRef.current) ytRef.current.seekTo(t, true);
+            else if (audioRef.current) audioRef.current.currentTime = t;
             setTime(t);
           }}
           onClose={() => setShowNow(false)}
         />
       )}
+
+      {/* hidden YT iframe — last-resort playback path */}
+      <div
+        id="yt-holder-wrap"
+        aria-hidden
+        className="pointer-events-none absolute left-0 top-0 h-px w-px overflow-hidden opacity-0"
+      >
+        <div id="yt-holder" />
+      </div>
 
       <audio
         ref={audioRef}
@@ -504,10 +612,14 @@ export default function MusicTab() {
         onPause={() => setPlaying(false)}
         onEnded={next}
         onError={() => {
-          // Signed stream URLs can expire/rate-limit — regenerate once
-          if (queue && retriedRef.current !== queue.songs[queue.index]?.id) {
-            retriedRef.current = queue.songs[queue.index].id;
-            playAt(queue.songs, queue.index);
+          // Signed stream URLs can expire/rate-limit — regenerate once,
+          // then fall back to the official embedded player
+          const q = queueRef.current;
+          if (q && retriedRef.current !== q.songs[q.index]?.id) {
+            retriedRef.current = q.songs[q.index].id;
+            playAtRef.current?.(q.songs, q.index);
+          } else if (videoIdRef.current) {
+            startIframeFallback();
           } else {
             setStreamError("Playback failed — try another song");
           }

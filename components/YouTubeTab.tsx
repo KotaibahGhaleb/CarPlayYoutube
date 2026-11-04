@@ -66,6 +66,7 @@ export default function YouTubeTab() {
     data: PipedStreamsResponse;
   } | null>(null);
   const [loadingStream, setLoadingStream] = useState(false);
+  const [embedFallback, setEmbedFallback] = useState(false);
 
   async function onSearch(e: FormEvent) {
     e.preventDefault();
@@ -85,6 +86,7 @@ export default function YouTubeTab() {
     const id = extractVideoId(item.url);
     setLoadingStream(true);
     setError("");
+    setEmbedFallback(false);
     try {
       const data = await getStreams(id);
       setPlaying({ id, data });
@@ -104,12 +106,23 @@ export default function YouTubeTab() {
       <div className="flex h-full flex-col lg:flex-row">
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="relative min-h-0 flex-1 bg-black">
-            <VideoPlayer
-              key={playing.id}
-              src={`/api/stream?v=${playing.id}&kind=video`}
-              hls={playing.data.hls}
-              poster={mediaUrl(playing.data.thumbnailUrl)}
-            />
+            {embedFallback ? (
+              <iframe
+                key={`${playing.id}-embed`}
+                src={`https://www.youtube-nocookie.com/embed/${playing.id}?autoplay=1&rel=0`}
+                allow="autoplay; encrypted-media; fullscreen"
+                allowFullScreen
+                className="h-full w-full border-0"
+              />
+            ) : (
+              <VideoPlayer
+                key={playing.id}
+                src={`/api/stream?v=${playing.id}&kind=video`}
+                hls={playing.data.hls}
+                poster={mediaUrl(playing.data.thumbnailUrl)}
+                onFatal={() => setEmbedFallback(true)}
+              />
+            )}
             <button
               onClick={() => setPlaying(null)}
               className="absolute left-3 top-3 rounded-full bg-black/70 px-4 py-2 text-sm font-bold backdrop-blur active:scale-95"
