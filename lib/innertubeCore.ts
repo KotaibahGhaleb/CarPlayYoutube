@@ -34,39 +34,70 @@ const CLIENT = {
   ua: "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
 };
 
-export async function getInnertubeStreams(videoId: string) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 12000);
-  let d: YTPlayerResponse;
-  try {
-    const res = await fetch(
-      "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-      {
-        method: "POST",
-        signal: ctrl.signal,
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": CLIENT.ua,
-        },
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: CLIENT.clientName,
-              clientVersion: CLIENT.clientVersion,
-              androidSdkVersion: CLIENT.androidSdkVersion,
-              hl: "en",
-              gl: "US",
-            },
+// Client identities tried in order — YouTube bot-checks different clients
+// independently, and ANDROID_VR often slips through when ANDROID is flagged.
+const PLAYER_CLIENTS = [
+  {
+    client: {
+      clientName: "ANDROID",
+      clientVersion: "20.10.38",
+      androidSdkVersion: 30,
+    },
+    ua: CLIENT.ua,
+  },
+  {
+    client: {
+      clientName: "ANDROID_VR",
+      clientVersion: "1.57.29",
+      deviceMake: "Oculus",
+      deviceModel: "Quest 3",
+      androidSdkVersion: 32,
+    },
+    ua: "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+  },
+];
+
+async function playerCall(videoId: string): Promise<YTPlayerResponse> {
+  let lastErr: unknown = null;
+  for (const c of PLAYER_CLIENTS) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 6000);
+    try {
+      const res = await fetch(
+        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+        {
+          method: "POST",
+          signal: ctrl.signal,
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": c.ua,
           },
-          videoId,
-        }),
-      }
-    );
-    if (!res.ok) throw new Error(`YouTube HTTP ${res.status}`);
-    d = await res.json();
-  } finally {
-    clearTimeout(t);
+          body: JSON.stringify({
+            context: { client: { ...c.client, hl: "en", gl: "US" } },
+            videoId,
+          }),
+        }
+      );
+      if (!res.ok) throw new Error(`YouTube HTTP ${res.status}`);
+      const d = (await res.json()) as YTPlayerResponse;
+      const sd = d.streamingData;
+      if (sd && (sd.formats?.length || sd.adaptiveFormats?.length)) return d;
+      lastErr = new Error(
+        d.playabilityStatus?.reason ??
+          d.playabilityStatus?.status ??
+          "no streams"
+      );
+    } catch (e) {
+      lastErr = e;
+    } finally {
+      clearTimeout(t);
+    }
   }
+  throw lastErr instanceof Error ? lastErr : new Error("YouTube failed");
+}
+
+export async function getInnertubeStreams(videoId: string) {
+  const d = await playerCall(videoId);
 
   const sd = d.streamingData;
   if (!sd || (!sd.formats?.length && !sd.adaptiveFormats?.length)) {

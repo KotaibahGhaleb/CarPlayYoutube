@@ -144,35 +144,43 @@ export async function GET(req: NextRequest) {
     }
 
     try {
-      const res = await Promise.any(
-        [
-          () =>
-            resolveOne(videoId, kind, "innertube", () =>
-              getInnertubeStreams(videoId)
-            ),
-          () =>
-            resolveOne(videoId, kind, "piped", () =>
-              pipedFetch<StreamSet>(
-                `/streams/${videoId}`,
-                7000,
-                (x) =>
-                  !!x &&
-                  ((x.audioStreams?.length ?? 0) > 0 ||
-                    (x.videoStreams?.length ?? 0) > 0)
-              )
-            ),
-          () =>
-            resolveOne(videoId, kind, "invidious", () =>
-              getInvidiousStreams(videoId)
-            ),
-        ].map(async (job) => {
-          const { url, src } = await job();
-          const r = await pipeUpstream(url, range);
-          if (!r) throw new Error(`${src} probe failed`);
-          cacheUrl(videoId, kind, url);
-          return r;
-        })
+      // Hard budget: rather fail in ~12s and let the client fall back to the
+      // official player than leave the user staring at a spinner for 20s+
+      const timeout = new Promise<never>((_, rej) =>
+        setTimeout(() => rej(new Error("resolution timeout")), 12000)
       );
+      const res = await Promise.race([
+        Promise.any(
+          [
+            () =>
+              resolveOne(videoId, kind, "innertube", () =>
+                getInnertubeStreams(videoId)
+              ),
+            () =>
+              resolveOne(videoId, kind, "piped", () =>
+                pipedFetch<StreamSet>(
+                  `/streams/${videoId}`,
+                  7000,
+                  (x) =>
+                    !!x &&
+                    ((x.audioStreams?.length ?? 0) > 0 ||
+                      (x.videoStreams?.length ?? 0) > 0)
+                )
+              ),
+            () =>
+              resolveOne(videoId, kind, "invidious", () =>
+                getInvidiousStreams(videoId)
+              ),
+          ].map(async (job) => {
+            const { url, src } = await job();
+            const r = await pipeUpstream(url, range);
+            if (!r) throw new Error(`${src} probe failed`);
+            cacheUrl(videoId, kind, url);
+            return r;
+          })
+        ),
+        timeout,
+      ]);
       return res;
     } catch {
       return NextResponse.json(

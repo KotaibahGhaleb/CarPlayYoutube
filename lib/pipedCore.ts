@@ -86,42 +86,38 @@ async function getInstances(): Promise<string[]> {
   return merged;
 }
 
-// Race instances in parallel batches — first valid response wins.
+// Race ALL instances in parallel — first valid response wins. Sequential
+// batches meant a single success could take ~20s; all-parallel caps the
+// worst case at one timeout.
 export async function pipedFetch<T>(
   path: string,
   timeoutMs = 7000,
   validate?: (d: T) => boolean
 ): Promise<T> {
   const instances = (await getInstances()).slice(0, 16);
-  const BATCH = 5;
   let lastError: unknown = null;
   let descriptive: Error | null = null;
   const isGeneric = (m: string) =>
     /fetch failed|bad payload|abort/i.test(m);
 
-  for (let i = 0; i < instances.length; i += BATCH) {
-    const batch = instances.slice(i, i + BATCH);
-    try {
-      const { base, data } = await Promise.any(
-        batch.map(async (base) => {
-          const data = await fetchJson<T>(base + path, timeoutMs);
-          // Some instances return HTTP 200 with an error body — treat as failure
-          if (validate && !validate(data)) throw new Error("bad payload");
-          return { base, data };
-        })
-      );
-      lastGood = base.replace(/\/+$/, "");
-      return data;
-    } catch (e) {
-      const errs = e instanceof AggregateError ? e.errors : [e];
-      lastError = errs[0];
-      if (!descriptive) {
-        const d = errs.find(
-          (x): x is Error => x instanceof Error && !isGeneric(x.message)
-        );
-        if (d) descriptive = d;
-      }
-    }
+  try {
+    const { base, data } = await Promise.any(
+      instances.map(async (base) => {
+        const data = await fetchJson<T>(base + path, timeoutMs);
+        // Some instances return HTTP 200 with an error body — treat as failure
+        if (validate && !validate(data)) throw new Error("bad payload");
+        return { base, data };
+      })
+    );
+    lastGood = base.replace(/\/+$/, "");
+    return data;
+  } catch (e) {
+    const errs = e instanceof AggregateError ? e.errors : [e];
+    lastError = errs[0];
+    const d = errs.find(
+      (x): x is Error => x instanceof Error && !isGeneric(x.message)
+    );
+    if (d) descriptive = d;
   }
   throw descriptive ?? (lastError instanceof Error
     ? lastError
