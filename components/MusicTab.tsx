@@ -1,7 +1,6 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { extractVideoId, searchYouTube } from "@/lib/piped";
 import { getLyrics, type LyricsResult } from "@/lib/lyrics";
 import {
   addPlaylist,
@@ -85,6 +84,7 @@ export default function MusicTab() {
   const reqRef = useRef(0);
   const retriedRef = useRef<string | null>(null);
   const videoIdRef = useRef("");
+  const pendingQueryRef = useRef("");
   const ytRef = useRef<any>(null);
   const pollRef = useRef<number | null>(null);
   const [useIframe, setUseIframe] = useState(false);
@@ -226,34 +226,20 @@ export default function MusicTab() {
     });
 
     try {
-      let videoId = song.youtubeId ?? vidCache.current.get(song.id) ?? "";
-      if (!videoId) {
-        const items = await searchYouTube(
-          `${song.name} ${song.artist}`,
-          "music_songs"
-        );
-        if (req !== reqRef.current) return;
-        if (!items.length) throw new Error("no match");
-        const target = (song.durationMs ?? 0) / 1000;
-        videoId = extractVideoId(
-          (target
-            ? items.reduce((a, b) =>
-                Math.abs(b.duration - target) < Math.abs(a.duration - target)
-                  ? b
-                  : a
-              )
-            : items[0]
-          ).url
-        );
-        vidCache.current.set(song.id, videoId);
-      }
-      // The proxy resolves + streams in one invocation — no signed URL
-      // ever reaches the browser, so IP-binding can't break playback.
+      const cached = song.youtubeId ?? vidCache.current.get(song.id) ?? "";
       const el = audioRef.current;
       if (req !== reqRef.current) return;
-      videoIdRef.current = videoId;
+      videoIdRef.current = cached;
+      // One server call does search+resolve+stream — no client round-trip
+      // between lookup and playback (was the biggest latency source).
+      const q = cached ? "" : `${song.name} ${song.artist}`;
+      pendingQueryRef.current = q;
       if (el) {
-        el.src = `/api/stream?v=${videoId}&kind=audio`;
+        el.src = cached
+          ? `/api/stream?v=${cached}&kind=audio`
+          : `/api/stream?q=${encodeURIComponent(q)}&dur=${Math.round(
+              (song.durationMs ?? 0) / 1000
+            )}&kind=audio`;
         await el.play().catch(() => {});
       }
     } catch (e) {
@@ -759,8 +745,8 @@ export default function MusicTab() {
         onPause={() => setPlaying(false)}
         onEnded={next}
         onError={() => {
-          // Signed stream URLs can expire/rate-limit — regenerate once,
-          // then fall back to the official embedded player
+          // Signed stream URLs can expire/rate-limit — retry once (cheap:
+          // caches make it near-instant), then fall back to official player
           const q = queueRef.current;
           if (q && retriedRef.current !== q.songs[q.index]?.id) {
             retriedRef.current = q.songs[q.index].id;
@@ -768,7 +754,30 @@ export default function MusicTab() {
           } else if (videoIdRef.current) {
             startIframeFallback();
           } else {
-            setStreamError("Playback failed — try another song");
+            // played via ?q= — resolve the videoId lazily for the iframe
+            void (async () => {
+              const qry = pendingQueryRef.current;
+              if (qry) {
+                try {
+                  const r = await fetch(
+                    `/api/stream?q=${encodeURIComponent(qry)}&meta=1`
+                  );
+                  const b = (await r.json()) as { videoId?: string };
+                  if (b?.videoId) {
+                    videoIdRef.current = b.videoId;
+                    const cur = queueRef.current;
+                    if (cur)
+                      vidCache.current.set(
+                        cur.songs[cur.index].id,
+                        b.videoId
+                      );
+                    startIframeFallback();
+                    return;
+                  }
+                } catch {}
+              }
+              setStreamError("Playback failed — try another song");
+            })();
           }
         }}
       />

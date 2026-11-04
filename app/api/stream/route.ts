@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pipedFetch } from "@/lib/pipedCore";
 import { getInvidiousStreams } from "@/lib/invidiousCore";
-import { getInnertubeStreams } from "@/lib/innertubeCore";
+import { getInnertubeStreams, searchInnertube } from "@/lib/innertubeCore";
 
 export const maxDuration = 300;
 
@@ -77,6 +77,45 @@ function cacheUrl(videoId: string, kind: string, url: string) {
   urlCache.set(`${videoId}:${kind}`, { url, exp: Date.now() + 5 * 60 * 1000 });
 }
 
+// Song-title → videoId, entirely server-side. Races direct YouTube search
+// against Piped; picks the candidate whose duration is closest to iTunes'.
+interface SearchItem {
+  url?: string;
+  duration?: number;
+}
+async function resolveVideoId(
+  q: string,
+  target: number
+): Promise<string | null> {
+  let items: SearchItem[] = [];
+  try {
+    const data = await Promise.any([
+      searchInnertube(q),
+      pipedFetch<SearchItem[] | { items?: SearchItem[] }>(
+        `/search?q=${encodeURIComponent(q)}&filter=music_songs`,
+        6000,
+        (x) => {
+          const arr = Array.isArray(x) ? x : x?.items;
+          return Array.isArray(arr) && arr.length > 0;
+        }
+      ),
+    ]);
+    items = Array.isArray(data) ? data : (data?.items ?? []);
+  } catch {
+    return null;
+  }
+  const vids = items
+    .map((i) => ({
+      id: i.url?.match(/[?&]v=([\w-]{11})/)?.[1] ?? "",
+      d: i.duration ?? 0,
+    }))
+    .filter((i) => i.id);
+  if (!vids.length) return null;
+  if (target > 0)
+    vids.sort((a, b) => Math.abs(a.d - target) - Math.abs(b.d - target));
+  return vids[0].id;
+}
+
 async function pipeUpstream(url: string, range: string | null) {
   const headers: Record<string, string> = {};
   if (range) headers.range = range;
@@ -124,8 +163,22 @@ async function pipeUpstream(url: string, range: string | null) {
 
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
-  const videoId = sp.get("v");
   const range = req.headers.get("range");
+
+  // Resolve videoId: ?v=ID directly, or ?q=song+artist&dur=seconds — the
+  // whole song→stream pipeline in ONE server invocation (kills a client
+  // round-trip and its whole failure surface).
+  let videoId = sp.get("v");
+  if (!videoId && sp.get("q")) {
+    videoId = await resolveVideoId(
+      sp.get("q")!,
+      Number(sp.get("dur")) || 0
+    );
+  }
+
+  if (videoId && sp.get("meta") === "1") {
+    return NextResponse.json({ videoId });
+  }
 
   // Mode 1: resolve + stream in one invocation. Cache hits skip everything;
   // misses race all providers concurrently and probe each URL as it lands —

@@ -50,6 +50,17 @@ export default function NowPlaying({
   const lineRefs = useRef<(HTMLParagraphElement | null)[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
   const [isFs, setIsFs] = useState(false);
+  const [secs, setSecs] = useState(0);
+
+  // elapsed counter while resolving — shows the user progress is happening
+  useEffect(() => {
+    if (!resolving) {
+      setSecs(0);
+      return;
+    }
+    const t = setInterval(() => setSecs((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [resolving]);
 
   useEffect(() => {
     lineRefs.current[activeIdx]?.scrollIntoView({
@@ -162,9 +173,16 @@ export default function NowPlaying({
           </div>
           <div className="lyrics-fade scrollbar-hide absolute inset-0 overflow-y-auto py-[25vh] sm:inset-y-0">
             {resolving ? (
-              <p className="px-4 text-center text-xl font-semibold text-neutral-500">
-                Finding song…
-              </p>
+              <div className="px-4 text-center">
+                <p className="text-xl font-semibold text-neutral-500">
+                  Finding song…
+                </p>
+                {secs >= 2 && (
+                  <p className="mt-2 text-sm tabular-nums text-neutral-600">
+                    {secs}s
+                  </p>
+                )}
+              </div>
             ) : streamError ? (
               <p className="px-4 text-center text-xl font-semibold text-red-400">
                 {streamError}
