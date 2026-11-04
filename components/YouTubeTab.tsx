@@ -2,7 +2,6 @@
 
 import { FormEvent, useState } from "react";
 import {
-  bestVideoStream,
   extractVideoId,
   getStreams,
   mediaUrl,
@@ -101,14 +100,13 @@ export default function YouTubeTab() {
   }
 
   if (playing) {
-    const v = bestVideoStream(playing.data.videoStreams);
     return (
       <div className="flex h-full flex-col lg:flex-row">
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="relative min-h-0 flex-1 bg-black">
             <VideoPlayer
               key={playing.id}
-              src={mediaUrl(v?.url)}
+              src={`/api/stream?v=${playing.id}&kind=video`}
               hls={playing.data.hls}
               poster={mediaUrl(playing.data.thumbnailUrl)}
             />

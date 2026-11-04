@@ -1,13 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import {
-  bestAudioStream,
-  extractVideoId,
-  getStreams,
-  mediaUrl,
-  searchYouTube,
-} from "@/lib/piped";
+import { extractVideoId, searchYouTube } from "@/lib/piped";
 import { getLyrics, type LyricsResult } from "@/lib/lyrics";
 import {
   addPlaylist,
@@ -197,20 +191,12 @@ export default function MusicTab() {
           ).url
         );
       }
-      const streams = await getStreams(videoId);
-      if (req !== reqRef.current) return;
-      const audio =
-        bestAudioStream(streams.audioStreams) ??
-        streams.videoStreams
-          ?.filter((s) => s.videoOnly === false && /^\d+p$/.test(s.quality))
-          .sort(
-            (a, b) => (parseInt(a.quality) || 0) - (parseInt(b.quality) || 0)
-          )[0];
-      if (!audio) throw new Error("no audio stream");
-
+      // The proxy resolves + streams in one invocation — no signed URL
+      // ever reaches the browser, so IP-binding can't break playback.
       const el = audioRef.current;
+      if (req !== reqRef.current) return;
       if (el) {
-        el.src = mediaUrl(audio.url)!;
+        el.src = `/api/stream?v=${videoId}&kind=audio`;
         await el.play().catch(() => {});
       }
     } catch (e) {
