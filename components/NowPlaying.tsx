@@ -51,6 +51,9 @@ export default function NowPlaying({
   const rootRef = useRef<HTMLDivElement>(null);
   const [isFs, setIsFs] = useState(false);
   const [secs, setSecs] = useState(0);
+  // auto-hide chrome while playing — any pointer activity brings it back
+  const [showUi, setShowUi] = useState(true);
+  const hideTimer = useRef<number | null>(null);
 
   // elapsed counter while resolving — shows the user progress is happening
   useEffect(() => {
@@ -75,6 +78,20 @@ export default function NowPlaying({
     return () => document.removeEventListener("fullscreenchange", onFs);
   }, []);
 
+  const pokeUi = () => {
+    setShowUi(true);
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    if (playing)
+      hideTimer.current = window.setTimeout(() => setShowUi(false), 3000);
+  };
+  useEffect(() => {
+    pokeUi();
+    return () => {
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing]);
+
   const toggleFs = () => {
     if (document.fullscreenElement)
       document.exitFullscreen().catch(() => {});
@@ -86,10 +103,18 @@ export default function NowPlaying({
   return (
     <div
       ref={rootRef}
-      className="absolute inset-0 z-50 flex flex-col bg-neutral-950"
+      onPointerDown={pokeUi}
+      onMouseMove={pokeUi}
+      className={`absolute inset-0 z-50 flex flex-col bg-neutral-950 ${
+        showUi ? "" : "cursor-none"
+      }`}
     >
       {/* top bar: back + eq + fullscreen */}
-      <div className="flex shrink-0 items-center justify-between px-4 py-3 md:px-8">
+      <div
+        className={`flex shrink-0 items-center justify-between px-4 py-3 transition-opacity duration-300 md:px-8 ${
+          showUi ? "opacity-100" : "pointer-events-none opacity-0"
+        }`}
+      >
         <button
           onClick={onClose}
           className="flex h-11 w-11 items-center justify-center rounded-full bg-neutral-900 text-xl active:scale-90"
@@ -222,8 +247,12 @@ export default function NowPlaying({
         </div>
       </div>
 
-      {/* controls — fixed at bottom */}
-      <div className="shrink-0 px-5 pb-5 pt-1 md:px-10">
+      {/* controls — fixed at bottom, auto-hide while playing */}
+      <div
+        className={`shrink-0 px-5 pb-5 pt-1 transition-opacity duration-300 md:px-10 ${
+          showUi ? "opacity-100" : "pointer-events-none opacity-0"
+        }`}
+      >
         <div
           className="group relative h-9 cursor-pointer"
           onClick={(e) => {
