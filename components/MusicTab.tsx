@@ -1,7 +1,10 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { getLyrics, type LyricsResult } from "@/lib/lyrics";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import AccountPanel from "./AccountPanel";
+import { usePlayback } from "./PlaybackProvider";
+import { useRemote } from "./RemoteProvider";
+import NowPlaying from "./NowPlaying";
 import {
   addPlaylist,
   getFavorites,
@@ -15,26 +18,7 @@ import {
   type SavedPlaylist,
   type Song,
 } from "@/lib/music";
-import { useRemote, useRemoteCommands } from "./RemoteProvider";
-import NowPlaying from "./NowPlaying";
-
-// YouTube IFrame API — last-resort playback path. When our stream extraction
-// is completely blocked, the official player still works everywhere
-// (may occasionally play an ad, but the app never dead-ends).
-/* eslint-disable @typescript-eslint/no-explicit-any */
-let ytApiPromise: Promise<any> | null = null;
-function loadYT(): Promise<any> {
-  if (ytApiPromise) return ytApiPromise;
-  ytApiPromise = new Promise((resolve) => {
-    const w = window as any;
-    if (w.YT?.Player) return resolve(w.YT);
-    const s = document.createElement("script");
-    s.src = "https://www.youtube.com/iframe_api";
-    document.head.appendChild(s);
-    w.onYouTubeIframeAPIReady = () => resolve(w.YT);
-  });
-  return ytApiPromise;
-}
+import type { HomeSection, LibraryPlaylist } from "@/lib/libraryTypes";
 
 function fmtDur(ms?: number) {
   if (!ms) return "";
@@ -55,66 +39,50 @@ function Heart({ filled }: { filled: boolean }) {
   );
 }
 
+function PlayIcon({ playing }: { playing: boolean }) {
+  return playing ? (
+    <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
+      <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
+    </svg>
+  ) : (
+    <svg viewBox="0 0 24 24" className="ml-0.5 h-5 w-5 fill-current">
+      <path d="M8 5v14l11-7z" />
+    </svg>
+  );
+}
+
 export default function MusicTab() {
   const remote = useRemote();
+  const player = usePlayback();
   const [listTitle, setListTitle] = useState("Top Songs");
   const [songs, setSongs] = useState<Song[]>([]);
+  const [home, setHome] = useState<HomeSection[] | null>(null);
   const [loadingList, setLoadingList] = useState(false);
   const [listError, setListError] = useState("");
   const [searchQ, setSearchQ] = useState("");
   const [favs, setFavs] = useState<Song[]>([]);
   const [playlists, setPlaylists] = useState<SavedPlaylist[]>([]);
+  const [accountPlaylists, setAccountPlaylists] = useState<LibraryPlaylist[]>([]);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [libraryTick, setLibraryTick] = useState(0);
   const [plInput, setPlInput] = useState("");
   const [plError, setPlError] = useState("");
+  const [hasMore, setHasMore] = useState(false);
+  const [morePath, setMorePath] = useState("");
 
-  // playback
-  const [queue, setQueue] = useState<{ songs: Song[]; index: number } | null>(
-    null
-  );
-  const [showNow, setShowNow] = useState(false);
-  const [resolving, setResolving] = useState(false);
-  const [streamError, setStreamError] = useState("");
-  const [lyrics, setLyrics] = useState<LyricsResult | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const [time, setTime] = useState(0);
-  const [dur, setDur] = useState(0);
+  const current = player.queue ? player.queue.songs[player.queue.index] : null;
+  const playing = player.phase === "playing";
+  const carPhase = String(remote.carState?.phase ?? "");
+  const carActive = carPhase === "playing" || carPhase === "buffering";
 
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const vidCache = useRef(new Map<string, string>());
-  const reqRef = useRef(0);
-  const retriedRef = useRef<string | null>(null);
-  const videoIdRef = useRef("");
-  const pendingQueryRef = useRef("");
-  const ytRef = useRef<any>(null);
-  const pollRef = useRef<number | null>(null);
-  const [useIframe, setUseIframe] = useState(false);
-
-  const current = queue ? queue.songs[queue.index] : null;
-  const queueRef = useRef(queue);
-  queueRef.current = queue;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const playAtRef = useRef<any>(null);
-
-  const stopIframe = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-    try {
-      ytRef.current?.destroy();
-    } catch {}
-    ytRef.current = null;
-  }, []);
-
-  useEffect(() => stopIframe, [stopIframe]);
-
-  // ---- list loaders ----
   const showTop = useCallback(async () => {
     setLoadingList(true);
     setListError("");
+    setHome(null);
+    setHasMore(false);
+    setMorePath("");
     try {
-      const s = await topSongs();
-      setSongs(s);
+      setSongs(await topSongs());
       setListTitle("Top Songs");
     } catch (e) {
       setListError(
@@ -126,23 +94,55 @@ export default function MusicTab() {
   }, []);
 
   const showFavs = useCallback(() => {
-    setFavs(getFavorites());
-    setSongs(getFavorites());
+    const items = getFavorites();
+    setFavs(items);
+    setSongs(items);
+    setHome(null);
+    setHasMore(false);
+    setMorePath("");
     setListTitle("Favorites");
+    setListError("");
   }, []);
 
   useEffect(() => {
     setPlaylists(getSavedPlaylists());
     setFavs(getFavorites());
-    showTop();
+    void showTop();
   }, [showTop]);
+
+  useEffect(() => {
+    let cancel = false;
+    void (async () => {
+      const res = await fetch("/api/library/status");
+      if (cancel || !res.ok) {
+        if (!cancel) setAccountPlaylists([]);
+        return;
+      }
+      const status = (await res.json()) as { connected?: boolean };
+      if (!status.connected) {
+        setAccountPlaylists([]);
+        return;
+      }
+      const lists = await fetch("/api/library/playlists?limit=25&offset=0");
+      const body = (await lists.json()) as { items?: LibraryPlaylist[] };
+      if (!cancel && lists.ok) setAccountPlaylists(body.items ?? []);
+    })().catch(() => {
+      if (!cancel) setAccountPlaylists([]);
+    });
+    return () => {
+      cancel = true;
+    };
+  }, [libraryTick]);
 
   async function openPlaylist(p: SavedPlaylist) {
     setLoadingList(true);
     setListError("");
+    setHome(null);
+    setHasMore(false);
+    setMorePath("");
     try {
-      const { name, songs } = await getPlaylistSongs(p.id);
-      setSongs(songs);
+      const { name, songs: rows } = await getPlaylistSongs(p.id);
+      setSongs(rows);
       setListTitle(name);
     } catch (e) {
       setListError(
@@ -163,10 +163,11 @@ export default function MusicTab() {
     setPlError("");
     setLoadingList(true);
     try {
-      const { name, songs } = await getPlaylistSongs(id);
-      if (!songs.length) throw new Error("empty playlist");
+      const { name, songs: rows } = await getPlaylistSongs(id);
+      if (!rows.length) throw new Error("empty playlist");
       setPlaylists(addPlaylist(id, name));
-      setSongs(songs);
+      setSongs(rows);
+      setHome(null);
       setListTitle(name);
       setPlInput("");
     } catch {
@@ -181,6 +182,9 @@ export default function MusicTab() {
     if (!searchQ.trim()) return;
     setLoadingList(true);
     setListError("");
+    setHome(null);
+    setHasMore(false);
+    setMorePath("");
     try {
       setSongs(await searchSongs(searchQ.trim()));
       setListTitle(`Results for "${searchQ.trim()}"`);
@@ -193,252 +197,144 @@ export default function MusicTab() {
     }
   }
 
-  // ---- playback ----
-  const playAt = useCallback(async (list: Song[], index: number) => {
-    const song = list[index];
-    if (!song) return;
-    if (remote.mode === "remote") {
-      remote.send({ t: "music-play", songs: list, index });
-      return;
-    }
-    const req = ++reqRef.current;
-    stopIframe();
-    setUseIframe(false);
-    setQueue({ songs: list, index });
-    setShowNow(true);
-    // tell the paired phone what's playing (no-op unless hosting)
-    remote.send({
-      t: "np",
-      name: song.name,
-      artist: song.artist,
-      art: song.art,
-    });
-    setResolving(true);
-    setStreamError("");
-    setLyrics(null);
-    setTime(0);
-
-    const lyricsPromise = getLyrics({
-      track: song.name,
-      artist: song.artist,
-      album: song.album,
-      duration: (song.durationMs ?? 0) / 1000,
-    });
-
+  async function loadAccount(path: string, title: string, append: boolean) {
+    setLoadingList(true);
+    setListError("");
+    setHome(null);
+    const offset = append ? songs.length : 0;
+    const join = path.includes("?") ? "&" : "?";
     try {
-      const cached = song.youtubeId ?? vidCache.current.get(song.id) ?? "";
-      const el = audioRef.current;
-      if (req !== reqRef.current) return;
-      videoIdRef.current = cached;
-      // One server call does search+resolve+stream — no client round-trip
-      // between lookup and playback (was the biggest latency source).
-      const q = cached ? "" : `${song.name} ${song.artist}`;
-      pendingQueryRef.current = q;
-      // Prefetch the videoId in parallel — if extraction fails (protected
-      // music videos are bot-checked on datacenter IPs), the iframe
-      // fallback can start instantly instead of another full cycle.
-      if (q) {
-        void fetch(`/api/stream?q=${encodeURIComponent(q)}&meta=1`)
-          .then((r) => r.json())
-          .then((b: { videoId?: string }) => {
-            if (b?.videoId && req === reqRef.current) {
-              videoIdRef.current = b.videoId;
-              vidCache.current.set(song.id, b.videoId);
-            }
-          })
-          .catch(() => {});
+      const res = await fetch(`${path}${join}limit=25&offset=${offset}`);
+      if (res.status === 401) {
+        setAccountOpen(true);
+        setListError("Unlock your library to see this list.");
+        return;
       }
-      if (el) {
-        el.src = cached
-          ? `/api/stream?v=${cached}&kind=audio`
-          : `/api/stream?q=${encodeURIComponent(q)}&dur=${Math.round(
-              (song.durationMs ?? 0) / 1000
-            )}&kind=audio`;
-        await el.play().catch(() => {});
+      const body = (await res.json()) as {
+        items?: Song[];
+        hasMore?: boolean;
+        error?: string;
+        message?: string;
+        name?: string;
+      };
+      if (!res.ok) {
+        setListError(body.message || body.error || "Couldn't load your library");
+        if (!append) setSongs([]);
+        return;
       }
+      const items = body.items ?? [];
+      setSongs(append ? [...songs, ...items] : items);
+      setListTitle(body.name || title);
+      setHasMore(!!body.hasMore);
+      setMorePath(path);
     } catch (e) {
-      if (req === reqRef.current)
-        setStreamError(
-          `Couldn't play this song${
-            e instanceof Error ? ` — ${e.message}` : ""
-          }`
-        );
+      setListError(
+        e instanceof Error ? e.message : "Couldn't load your library"
+      );
     } finally {
-      if (req === reqRef.current) setResolving(false);
+      setLoadingList(false);
     }
+  }
 
-    const l = await lyricsPromise;
-    if (req === reqRef.current) setLyrics(l);
-  }, [stopIframe, remote]);
-
-  playAtRef.current = playAt;
-
-  // Official YT player as last resort — when extraction is fully blocked
-  const startIframeFallback = useCallback(async () => {
-    const req = reqRef.current;
-    setStreamError("");
-    setResolving(false);
-    setUseIframe(true);
-    const YT = await loadYT();
-    if (req !== reqRef.current) return;
-    stopIframe();
-    const wrap = document.getElementById("yt-holder-wrap");
-    if (wrap) wrap.innerHTML = '<div id="yt-holder"></div>';
-    ytRef.current = new YT.Player("yt-holder", {
-      videoId: videoIdRef.current,
-      playerVars: { autoplay: 1, controls: 0, disablekb: 1 },
-      events: {
-        onReady: (e: any) => e.target.playVideo(),
-        onStateChange: (e: any) => {
-          const st = YT.PlayerState;
-          if (e.data === st.PLAYING) {
-            setPlaying(true);
-            setDur(e.target.getDuration() || 0);
-            if (pollRef.current) clearInterval(pollRef.current);
-            pollRef.current = window.setInterval(
-              () => setTime(e.target.getCurrentTime() || 0),
-              500
-            );
-          } else if (e.data === st.PAUSED) {
-            setPlaying(false);
-          } else if (e.data === st.ENDED) {
-            setPlaying(false);
-            const q = queueRef.current;
-            if (q)
-              playAtRef.current?.(
-                q.songs,
-                (q.index + 1) % q.songs.length
-              );
-          }
-        },
-      },
-    });
-  }, [stopIframe]);
-
-  const next = useCallback(() => {
-    if (remote.mode === "remote") {
-      remote.send({ t: "ctl", a: "next" });
-      return;
-    }
-    if (!queue) return;
-    playAt(queue.songs, (queue.index + 1) % queue.songs.length);
-  }, [queue, playAt, remote]);
-
-  const prev = useCallback(() => {
-    if (remote.mode === "remote") {
-      remote.send({ t: "ctl", a: "prev" });
-      return;
-    }
-    if (useIframe && ytRef.current) {
-      const t = ytRef.current.getCurrentTime?.() ?? 0;
-      if (t > 3) {
-        ytRef.current.seekTo(0, true);
+  async function showHomeFeed() {
+    setLoadingList(true);
+    setListError("");
+    setSongs([]);
+    setHasMore(false);
+    setMorePath("");
+    try {
+      const res = await fetch("/api/library/home?limit=8");
+      if (res.status === 401) {
+        setAccountOpen(true);
+        setListError("Unlock your library to see recommendations.");
+        setHome(null);
         return;
       }
-    }
-    const el = audioRef.current;
-    if (el && el.currentTime > 3 && queue) {
-      el.currentTime = 0;
-      return;
-    }
-    if (!queue) return;
-    playAt(
-      queue.songs,
-      (queue.index - 1 + queue.songs.length) % queue.songs.length
-    );
-  }, [queue, playAt, useIframe, remote]);
-
-  const toggle = useCallback(() => {
-    if (remote.mode === "remote") {
-      remote.send({ t: "ctl", a: "toggle" });
-      return;
-    }
-    if (useIframe && ytRef.current) {
-      if (ytRef.current.getPlayerState?.() === 1) ytRef.current.pauseVideo();
-      else ytRef.current.playVideo();
-      return;
-    }
-    const el = audioRef.current;
-    if (!el) return;
-    if (el.paused) el.play().catch(() => {});
-    else el.pause();
-  }, [useIframe, remote]);
-
-  const seek = useCallback(
-    (t: number) => {
-      if (remote.mode === "remote") {
-        remote.send({ t: "ctl", a: "seek", v: t });
+      const body = (await res.json()) as {
+        sections?: HomeSection[];
+        error?: string;
+        message?: string;
+      };
+      if (!res.ok) {
+        setHome(null);
+        setListError(body.message || body.error || "Couldn't load recommendations");
         return;
       }
-      if (useIframe && ytRef.current) ytRef.current.seekTo(t, true);
-      else if (audioRef.current) audioRef.current.currentTime = t;
-      setTime(t);
-    },
-    [useIframe, remote]
+      setHome(body.sections ?? []);
+      setListTitle("For You");
+    } catch (e) {
+      setHome(null);
+      setListError(e instanceof Error ? e.message : "Couldn't load recommendations");
+    } finally {
+      setLoadingList(false);
+    }
+  }
+
+  function playSong(list: Song[], index: number) {
+    const song = list[index];
+    if (song?.available === false) {
+      setListError("That track is unavailable in your library.");
+      return;
+    }
+    player.playAt(list, index);
+  }
+
+  const libraryButtons = (
+    <>
+      <button
+        onClick={() => setAccountOpen(true)}
+        className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+      >
+        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-red-600 text-xl">
+          ▷
+        </span>
+        <span className="min-w-0">
+          <span className="block truncate text-sm font-bold">YouTube Music</span>
+          <span className="text-xs text-neutral-500">
+            {accountPlaylists.length ? "Connected" : "Connect account"}
+          </span>
+        </span>
+      </button>
+      {accountPlaylists.length > 0 && (
+        <>
+          <button
+            onClick={() => void loadAccount("/api/library/liked", "Liked Songs", false)}
+            className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+          >
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-lg">
+              ♥
+            </span>
+            <span className="block truncate text-sm font-semibold">Liked Songs</span>
+          </button>
+          <button
+            onClick={() => void loadAccount("/api/library/songs", "Library Songs", false)}
+            className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+          >
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-lg">
+              ♪
+            </span>
+            <span className="block truncate text-sm font-semibold">Library Songs</span>
+          </button>
+          <button
+            onClick={() => void showHomeFeed()}
+            className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+          >
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-lg">
+              ✶
+            </span>
+            <span className="block truncate text-sm font-semibold">For You</span>
+          </button>
+        </>
+      )}
+    </>
   );
 
-  // car screen: execute commands coming from the paired phone
-  useRemoteCommands((m) => {
-    if (m.t === "music-play" && Array.isArray(m.songs)) {
-      void playAt(m.songs as Song[], Number(m.index) || 0);
-    } else if (m.t === "ctl") {
-      const el = audioRef.current;
-      if (m.a === "toggle") {
-        if (useIframe && ytRef.current) {
-          if (ytRef.current.getPlayerState?.() === 1)
-            ytRef.current.pauseVideo();
-          else ytRef.current.playVideo();
-        } else if (el) {
-          if (el.paused) el.play().catch(() => {});
-          else el.pause();
-        }
-      } else if (m.a === "seek" && typeof m.v === "number") {
-        if (useIframe && ytRef.current) ytRef.current.seekTo(m.v, true);
-        else if (el) el.currentTime = m.v;
-      }
-      // next/prev go through the refs (they may still be mid-render here)
-      else if (m.a === "next" || m.a === "prev") {
-        const q = queueRef.current;
-        if (!q) return;
-        if (m.a === "prev" && el && el.currentTime > 3) {
-          el.currentTime = 0;
-          return;
-        }
-        playAtRef.current?.(
-          q.songs,
-          m.a === "next"
-            ? (q.index + 1) % q.songs.length
-            : (q.index - 1 + q.songs.length) % q.songs.length
-        );
-      }
-    }
-  });
-
-  // media session — car/lock-screen controls
-  useEffect(() => {
-    if (!("mediaSession" in navigator) || !current) return;
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: current.name,
-      artist: current.artist,
-      album: current.album ?? "",
-      artwork: current.art
-        ? [{ src: current.art, sizes: "600x600", type: "image/jpeg" }]
-        : [],
-    });
-    navigator.mediaSession.setActionHandler("play", toggle);
-    navigator.mediaSession.setActionHandler("pause", toggle);
-    navigator.mediaSession.setActionHandler("nexttrack", next);
-    navigator.mediaSession.setActionHandler("previoustrack", prev);
-  }, [current, toggle, next, prev]);
-
-  // ---- render ----
   return (
     <div className="relative flex h-full">
-      {/* sidebar — hidden on phones, replaced by the horizontal strip below */}
       <aside className="hidden w-60 shrink-0 flex-col border-r border-neutral-800 md:flex md:w-72">
         <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
           <button
-            onClick={showTop}
+            onClick={() => void showTop()}
             className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
           >
             <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-orange-500 to-red-500 text-xl">
@@ -454,24 +350,48 @@ export default function MusicTab() {
               ♥
             </span>
             <span className="min-w-0">
-              <span className="block truncate text-sm font-bold">
-                Favorites
-              </span>
-              <span className="text-xs text-neutral-500">
-                {favs.length} songs
-              </span>
+              <span className="block truncate text-sm font-bold">Favorites</span>
+              <span className="text-xs text-neutral-500">{favs.length} songs</span>
             </span>
           </button>
-
+          {libraryButtons}
+          {accountPlaylists.length > 0 && (
+            <p className="mb-1 mt-4 px-2 text-xs font-bold uppercase tracking-wider text-neutral-500">
+              My playlists
+            </p>
+          )}
+          {accountPlaylists.map((p) => (
+            <button
+              key={p.id}
+              onClick={() =>
+                void loadAccount(
+                  `/api/library/playlist?id=${encodeURIComponent(p.id)}`,
+                  p.name,
+                  false
+                )
+              }
+              className="mb-1 flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
+            >
+              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-lg">
+                ▶
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-sm font-semibold">{p.name}</span>
+                {p.count && (
+                  <span className="text-xs text-neutral-500">{p.count} songs</span>
+                )}
+              </span>
+            </button>
+          ))}
           {playlists.length > 0 && (
             <p className="mb-1 mt-4 px-2 text-xs font-bold uppercase tracking-wider text-neutral-500">
-              Your playlists
+              Imported
             </p>
           )}
           {playlists.map((p) => (
             <div key={p.id} className="group mb-1 flex items-center">
               <button
-                onClick={() => openPlaylist(p)}
+                onClick={() => void openPlaylist(p)}
                 className="flex min-w-0 flex-1 items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900 active:scale-95"
               >
                 <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-lg">
@@ -491,12 +411,7 @@ export default function MusicTab() {
             </div>
           ))}
         </div>
-
-        {/* playlist import */}
-        <form
-          onSubmit={onImport}
-          className="shrink-0 border-t border-neutral-800 p-3"
-        >
+        <form onSubmit={onImport} className="shrink-0 border-t border-neutral-800 p-3">
           <input
             value={plInput}
             onChange={(e) => setPlInput(e.target.value)}
@@ -509,7 +424,6 @@ export default function MusicTab() {
         </form>
       </aside>
 
-      {/* main */}
       <div className="flex min-w-0 flex-1 flex-col">
         <form onSubmit={onSearch} className="flex shrink-0 gap-3 p-3 pb-2 md:p-4 md:pb-2">
           <input
@@ -519,11 +433,9 @@ export default function MusicTab() {
             className="h-12 min-w-0 flex-1 rounded-2xl border border-neutral-800 bg-neutral-900 px-5 outline-none placeholder:text-neutral-500 focus:border-green-600"
           />
         </form>
-
-        {/* mobile library strip — phones only */}
         <div className="scrollbar-hide flex shrink-0 gap-2 overflow-x-auto px-3 pb-2 md:hidden">
           <button
-            onClick={showTop}
+            onClick={() => void showTop()}
             className="flex shrink-0 items-center gap-1.5 rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
           >
             ♫ Top
@@ -534,10 +446,34 @@ export default function MusicTab() {
           >
             ♥ Favs
           </button>
+          <button
+            onClick={() => setAccountOpen(true)}
+            className="flex shrink-0 items-center rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+          >
+            YouTube Music
+          </button>
+          <button
+            onClick={() => void loadAccount("/api/library/liked", "Liked Songs", false)}
+            className="flex shrink-0 items-center rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+          >
+            Liked
+          </button>
+          <button
+            onClick={() => void loadAccount("/api/library/songs", "Library Songs", false)}
+            className="flex shrink-0 items-center rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+          >
+            Library
+          </button>
+          <button
+            onClick={() => void showHomeFeed()}
+            className="flex shrink-0 items-center rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
+          >
+            For You
+          </button>
           {playlists.map((p) => (
             <button
               key={p.id}
-              onClick={() => openPlaylist(p)}
+              onClick={() => void openPlaylist(p)}
               className="flex shrink-0 items-center rounded-full bg-neutral-800 px-4 py-2 text-xs font-bold active:scale-95"
             >
               {p.name}
@@ -551,8 +487,58 @@ export default function MusicTab() {
           <p className="shrink-0 px-5 pb-1 text-sm text-red-400">{listError}</p>
         )}
         <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
-          {loadingList ? (
+          {loadingList && songs.length === 0 && !home ? (
             <p className="p-4 text-neutral-500">Loading…</p>
+          ) : home ? (
+            home.length === 0 ? (
+              <p className="p-4 text-neutral-600">No recommendations returned</p>
+            ) : (
+              home.map((section) => (
+                <section key={section.title} className="mb-4">
+                  <p className="px-2 py-2 text-sm font-bold">{section.title}</p>
+                  {section.items.length === 0 ? (
+                    <p className="px-2 text-xs text-neutral-600">Nothing playable in this section</p>
+                  ) : (
+                    section.items.map((item) =>
+                      item.kind === "playlist" ? (
+                        <button
+                          key={item.id}
+                          onClick={() =>
+                            void loadAccount(
+                              `/api/library/playlist?id=${encodeURIComponent(item.id)}`,
+                              item.name,
+                              false
+                            )
+                          }
+                          className="flex w-full items-center gap-3 rounded-xl p-2.5 text-left hover:bg-neutral-900"
+                        >
+                          <span className="flex h-12 w-12 items-center justify-center rounded-lg bg-neutral-800">
+                            ▶
+                          </span>
+                          <span className="truncate text-sm font-semibold">{item.name}</span>
+                        </button>
+                      ) : (
+                        <SongRow
+                          key={item.song.youtubeId || item.song.id}
+                          song={item.song}
+                          current={current?.id === item.song.id}
+                          playing={playing && current?.id === item.song.id}
+                          fav={favs.some((f) => f.id === item.song.id)}
+                          onPlay={() => {
+                            const queue = section.items.flatMap((entry) =>
+                              entry.kind === "song" ? [entry.song] : []
+                            );
+                            const index = queue.findIndex((s) => s.id === item.song.id);
+                            playSong(queue, Math.max(0, index));
+                          }}
+                          onFav={() => setFavs(toggleFavorite(item.song))}
+                        />
+                      )
+                    )
+                  )}
+                </section>
+              ))
+            )
           ) : songs.length === 0 ? (
             <p className="p-4 text-neutral-600">
               {listTitle === "Favorites"
@@ -560,120 +546,60 @@ export default function MusicTab() {
                 : "Nothing here"}
             </p>
           ) : (
-            songs.map((s, i) => {
-              const isCurrent = current?.id === s.id;
-              const isFav = favs.some((f) => f.id === s.id);
-              return (
-                <div
+            <>
+              {songs.map((s, i) => (
+                <SongRow
                   key={`${s.id}-${i}`}
-                  className={`flex w-full items-center gap-3 rounded-xl p-2.5 text-left transition ${
-                    isCurrent ? "bg-neutral-900" : "hover:bg-neutral-900/70"
-                  }`}
+                  song={s}
+                  current={current?.id === s.id}
+                  playing={playing && current?.id === s.id}
+                  fav={favs.some((f) => f.id === s.id)}
+                  onPlay={() => playSong(songs, i)}
+                  onFav={() => setFavs(toggleFavorite(s))}
+                />
+              ))}
+              {hasMore && (
+                <button
+                  onClick={() => void loadAccount(morePath, listTitle, true)}
+                  disabled={loadingList}
+                  className="mx-auto mt-2 block rounded-full bg-neutral-800 px-5 py-2 text-sm font-bold disabled:opacity-50"
                 >
-                  <button
-                    onClick={() => playAt(songs, i)}
-                    className="flex min-w-0 flex-1 items-center gap-3 text-left active:scale-95"
-                  >
-                    {s.art ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={s.art}
-                        alt=""
-                        className="h-12 w-12 shrink-0 rounded-lg object-cover"
-                      />
-                    ) : (
-                      <span className="h-12 w-12 shrink-0 rounded-lg bg-neutral-800" />
-                    )}
-                    <span className="min-w-0 flex-1">
-                      <span
-                        className={`block truncate text-sm font-semibold ${
-                          isCurrent ? "text-green-400" : ""
-                        }`}
-                      >
-                        {s.name}
-                      </span>
-                      <span className="block truncate text-xs text-neutral-400">
-                        {s.artist}
-                      </span>
-                    </span>
-                    {isCurrent && playing && (
-                      <span className="flex items-end gap-0.5 pr-1">
-                        {[0, 1, 2].map((j) => (
-                          <span
-                            key={j}
-                            className="eq-bar inline-block w-0.5 rounded-full bg-green-500"
-                            style={{
-                              height: `${8 + j * 4}px`,
-                              animationDelay: `${j * 0.2}s`,
-                            }}
-                          />
-                        ))}
-                      </span>
-                    )}
-                    <span className="shrink-0 text-xs tabular-nums text-neutral-500">
-                      {fmtDur(s.durationMs)}
-                    </span>
-                  </button>
-                  <button
-                    onClick={() => setFavs(toggleFavorite(s))}
-                    className="shrink-0 rounded-full p-2 hover:bg-neutral-800"
-                    aria-label="Favorite"
-                  >
-                    <Heart filled={isFav} />
-                  </button>
-                </div>
-              );
-            })
+                  {loadingList ? "Loading…" : "Load more"}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
 
-      {/* mini player bar */}
-      {current && !showNow && (
+      {current && !player.showNow && (
         <button
-          onClick={() => setShowNow(true)}
+          onClick={() => player.setShowNow(true)}
           className="absolute bottom-3 left-1/2 z-40 flex w-[calc(100%-2rem)] max-w-xl -translate-x-1/2 items-center gap-3 rounded-2xl border border-neutral-700 bg-neutral-900/95 p-2.5 text-left shadow-xl backdrop-blur"
         >
           {current.art && (
             // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={current.art}
-              alt=""
-              className="h-11 w-11 rounded-lg object-cover"
-            />
+            <img src={current.art} alt="" className="h-11 w-11 rounded-lg object-cover" />
           )}
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-bold">
-              {current.name}
-            </span>
-            <span className="block truncate text-xs text-neutral-400">
-              {current.artist}
-            </span>
+            <span className="block truncate text-sm font-bold">{current.name}</span>
+            <span className="block truncate text-xs text-neutral-400">{current.artist}</span>
           </span>
           <span
             role="button"
             tabIndex={0}
             onClick={(e) => {
               e.stopPropagation();
-              toggle();
+              player.toggle();
             }}
-            onKeyDown={(e) => e.key === "Enter" && toggle()}
+            onKeyDown={(e) => e.key === "Enter" && player.toggle()}
             className="flex h-11 w-11 items-center justify-center rounded-full bg-white text-black"
           >
-            {playing ? (
-              <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
-                <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
-              </svg>
-            ) : (
-              <svg viewBox="0 0 24 24" className="ml-0.5 h-5 w-5 fill-current">
-                <path d="M8 5v14l11-7z" />
-              </svg>
-            )}
+            <PlayIcon playing={playing} />
           </span>
         </button>
       )}
 
-      {/* remote control bar — phone mirroring mode */}
       {remote.mode === "remote" && remote.carState?.name != null && (
         <div className="absolute bottom-3 left-1/2 z-40 flex w-[calc(100%-2rem)] max-w-xl -translate-x-1/2 items-center gap-3 rounded-2xl border border-blue-900 bg-neutral-900/95 p-2.5 shadow-xl backdrop-blur">
           {typeof remote.carState.art === "string" && remote.carState.art && (
@@ -693,7 +619,7 @@ export default function MusicTab() {
             </span>
           </span>
           <button
-            onClick={prev}
+            onClick={player.prev}
             className="flex h-11 w-11 items-center justify-center rounded-full text-neutral-300 hover:bg-neutral-800"
             aria-label="Previous"
           >
@@ -702,16 +628,14 @@ export default function MusicTab() {
             </svg>
           </button>
           <button
-            onClick={toggle}
+            onClick={player.toggle}
             className="flex h-11 w-11 items-center justify-center rounded-full bg-white text-black"
-            aria-label="Play/pause"
+            aria-label={carActive ? "Pause" : "Play"}
           >
-            <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
-              <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
-            </svg>
+            <PlayIcon playing={carActive} />
           </button>
           <button
-            onClick={next}
+            onClick={player.next}
             className="flex h-11 w-11 items-center justify-center rounded-full text-neutral-300 hover:bg-neutral-800"
             aria-label="Next"
           >
@@ -722,86 +646,105 @@ export default function MusicTab() {
         </div>
       )}
 
-      {/* full now-playing */}
-      {showNow && current && (
+      {player.showNow && current && (
         <NowPlaying
           track={current}
           playing={playing}
-          time={time}
-          dur={dur}
-          lyrics={lyrics}
-          resolving={resolving}
-          streamError={streamError}
-          onToggle={toggle}
-          onNext={next}
-          onPrev={prev}
-          onSeek={seek}
-          onClose={() => setShowNow(false)}
+          buffering={player.phase === "buffering"}
+          time={player.time}
+          dur={player.dur}
+          lyrics={player.lyrics}
+          resolving={player.phase === "resolving"}
+          streamError={player.phase === "error" ? player.error || "Playback failed" : ""}
+          needsGesture={player.needsGesture}
+          choosing={player.choosing}
+          alternatives={player.alternatives}
+          engineLabel={player.engine === "iframe" ? "Official player" : ""}
+          onToggle={player.toggle}
+          onNext={player.next}
+          onPrev={player.prev}
+          onSeek={player.seek}
+          onClose={() => player.setShowNow(false)}
+          onChoose={player.chooseVersion}
+          onOpenVersions={player.openVersions}
+          onRetry={player.retry}
         />
       )}
 
-      {/* hidden YT iframe — last-resort playback path */}
-      <div
-        id="yt-holder-wrap"
-        aria-hidden
-        className="pointer-events-none absolute left-0 top-0 h-px w-px overflow-hidden opacity-0"
-      >
-        <div id="yt-holder" />
-      </div>
+      {accountOpen && (
+        <AccountPanel
+          onClose={() => setAccountOpen(false)}
+          onChanged={() => setLibraryTick((n) => n + 1)}
+        />
+      )}
+    </div>
+  );
+}
 
-      <audio
-        ref={audioRef}
-        className="hidden"
-        onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
-        onLoadedMetadata={(e) => setDur(e.currentTarget.duration)}
-        onDurationChange={(e) => setDur(e.currentTarget.duration)}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onEnded={next}
-        onError={() => {
-          // Signed stream URLs can expire/rate-limit — retry once (cheap:
-          // caches make it near-instant), then fall back to official player
-          const q = queueRef.current;
-          // v-mode retry is cheap (videoId cached); q-mode failures mean
-          // extraction is blocked — go straight to the fallback path
-          if (
-            q &&
-            videoIdRef.current &&
-            !pendingQueryRef.current &&
-            retriedRef.current !== q.songs[q.index]?.id
-          ) {
-            retriedRef.current = q.songs[q.index].id;
-            playAtRef.current?.(q.songs, q.index);
-          } else if (videoIdRef.current) {
-            startIframeFallback();
-          } else {
-            // played via ?q= — resolve the videoId lazily for the iframe
-            void (async () => {
-              const qry = pendingQueryRef.current;
-              if (qry) {
-                try {
-                  const r = await fetch(
-                    `/api/stream?q=${encodeURIComponent(qry)}&meta=1`
-                  );
-                  const b = (await r.json()) as { videoId?: string };
-                  if (b?.videoId) {
-                    videoIdRef.current = b.videoId;
-                    const cur = queueRef.current;
-                    if (cur)
-                      vidCache.current.set(
-                        cur.songs[cur.index].id,
-                        b.videoId
-                      );
-                    startIframeFallback();
-                    return;
-                  }
-                } catch {}
-              }
-              setStreamError("Playback failed — try another song");
-            })();
-          }
-        }}
-      />
+function SongRow({
+  song,
+  current,
+  playing,
+  fav,
+  onPlay,
+  onFav,
+}: {
+  song: Song;
+  current: boolean;
+  playing: boolean;
+  fav: boolean;
+  onPlay: () => void;
+  onFav: () => void;
+}) {
+  const unavailable = song.available === false;
+  return (
+    <div
+      className={`flex w-full items-center gap-3 rounded-xl p-2.5 text-left transition ${
+        current ? "bg-neutral-900" : "hover:bg-neutral-900/70"
+      } ${unavailable ? "opacity-50" : ""}`}
+    >
+      <button
+        onClick={onPlay}
+        disabled={unavailable}
+        className="flex min-w-0 flex-1 items-center gap-3 text-left active:scale-95 disabled:active:scale-100"
+      >
+        {song.art ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={song.art} alt="" className="h-12 w-12 shrink-0 rounded-lg object-cover" />
+        ) : (
+          <span className="h-12 w-12 shrink-0 rounded-lg bg-neutral-800" />
+        )}
+        <span className="min-w-0 flex-1">
+          <span className={`block truncate text-sm font-semibold ${current ? "text-green-400" : ""}`}>
+            {song.name}
+          </span>
+          <span className="block truncate text-xs text-neutral-400">
+            {song.artist}
+            {unavailable ? " · Unavailable" : ""}
+          </span>
+        </span>
+        {current && playing && (
+          <span className="flex items-end gap-0.5 pr-1">
+            {[0, 1, 2].map((j) => (
+              <span
+                key={j}
+                className="eq-bar inline-block w-0.5 rounded-full bg-green-500"
+                style={{ height: `${8 + j * 4}px`, animationDelay: `${j * 0.2}s` }}
+              />
+            ))}
+          </span>
+        )}
+        <span className="shrink-0 text-xs tabular-nums text-neutral-500">
+          {fmtDur(song.durationMs)}
+        </span>
+      </button>
+      <button
+        onClick={onFav}
+        className="shrink-0 rounded-full p-2 hover:bg-neutral-800"
+        aria-label="Favorite"
+      >
+        <Heart filled={fav} />
+      </button>
     </div>
   );
 }

@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test lib/match.test.ts lib/playbackMachine.test.ts lib/streamProxy.test.ts lib/corrections.test.ts lib/commandDedupe.test.ts lib/libraryGate.test.ts lib/sanitize.test.ts lib/resolveConsistency.test.ts && python services/ytmusic/test_map_items.py",
+    "library": "python services/ytmusic/server.py"
   },
   "dependencies": {
     "hls.js": "^1.5.20",
@@ -20,6 +23,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "tailwindcss": "^4.1.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.0"
   }
 }

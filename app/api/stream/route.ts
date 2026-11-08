@@ -1,15 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { pipedFetch } from "@/lib/pipedCore";
+import { getInnertubeStreams } from "@/lib/innertubeCore";
 import { getInvidiousStreams } from "@/lib/invidiousCore";
-import { getInnertubeStreams, searchInnertube } from "@/lib/innertubeCore";
+import { canonicalVideoId, type MatchDecision, type RankedCandidate } from "@/lib/match";
+import { pipedFetch } from "@/lib/pipedCore";
+import { resolveTrack } from "@/lib/resolveSong";
+import { sanitizeError } from "@/lib/sanitize";
+import {
+  classifyFailure,
+  openUpstream,
+  proxyResponseHeaders,
+  raceProviders,
+  type StreamKind,
+} from "@/lib/streamProxy";
 
+export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-// Media proxy — two modes:
-//   /api/stream?v=VIDEO_ID&kind=audio|video  → resolve a fresh stream URL
-//     and pipe it within the SAME request (signed URLs are IP-bound, so
-//     resolving + fetching in one invocation keeps the signature valid)
-//   /api/stream?url=ENCODED_URL             → plain passthrough (thumbnails)
+// Connecting a YouTube Music account does not make these extracted URLs reliable.
+// Signed googlevideo URLs stay on the server; they are never logged or returned.
 
 const ALLOWED_HOST =
   /(^|\.)googlevideo\.com$|(^|\.)ggpht\.com$|(^|\.)ytimg\.com$|(^|\.)googleusercontent\.com$|pipedproxy|(^|\.)piped\.|pipedapi|invidious|(^|\.)iv\.|odycdn\.com$|videoplayback/i;
@@ -24,13 +32,7 @@ interface StreamSet {
   }[];
 }
 
-// Top-N candidate URLs per provider — if the best-quality URL is IP-bound
-// or bot-checked, the next format may still pipe fine.
-function pickUrls(
-  s: StreamSet,
-  kind: "audio" | "video",
-  n = 3
-): string[] {
+function pickUrls(s: StreamSet, kind: StreamKind, n = 3): string[] {
   if (kind === "audio") {
     const m4a = (s.audioStreams ?? []).filter((x) =>
       /mp4|m4a|aac/i.test(x.mimeType ?? "")
@@ -55,24 +57,6 @@ function pickUrls(
     .map((x) => x.url);
 }
 
-// Resolve each provider CONCURRENTLY — the first URL that actually delivers
-// bytes wins. Innertube usually answers in <1s; if it's bot-blocked, Piped/
-// Invidious racing in parallel still beats waiting for them sequentially.
-// (Piped/Invidious URLs may be bound to THEIR IPs — the probe weeds those out.)
-async function resolveOne(
-  videoId: string,
-  kind: "audio" | "video",
-  src: string,
-  resolveFn: () => Promise<StreamSet>
-): Promise<{ urls: string[]; src: string }> {
-  const d = await resolveFn();
-  const urls = pickUrls(d, kind, 3);
-  if (!urls.length) throw new Error(`${src}: no usable stream`);
-  return { urls, src };
-}
-
-// Per-warm-instance cache of WORKING upstream URLs — skips resolution + probe
-// entirely on repeats (signed URLs live ~6h; we keep them 5 min to be safe)
 const urlCache = new Map<string, { url: string; exp: number }>();
 function cachedUrl(videoId: string, kind: string): string | null {
   const c = urlCache.get(`${videoId}:${kind}`);
@@ -83,179 +67,200 @@ function cacheUrl(videoId: string, kind: string, url: string) {
   urlCache.set(`${videoId}:${kind}`, { url, exp: Date.now() + 5 * 60 * 1000 });
 }
 
-// Song-title → videoId, entirely server-side. Races direct YouTube search
-// against Piped; picks the candidate whose duration is closest to iTunes'.
-interface SearchItem {
-  url?: string;
-  duration?: number;
+function pub(c: RankedCandidate) {
+  return {
+    videoId: c.videoId,
+    title: c.title,
+    author: c.author,
+    durationSec: c.durationSec,
+    notes: c.notes,
+  };
 }
-async function resolveVideoId(
-  q: string,
-  target: number
-): Promise<string | null> {
-  let items: SearchItem[] = [];
-  try {
-    const data = await Promise.any([
-      searchInnertube(q),
-      pipedFetch<SearchItem[] | { items?: SearchItem[] }>(
-        `/search?q=${encodeURIComponent(q)}&filter=music_songs`,
-        6000,
-        (x) => {
-          const arr = Array.isArray(x) ? x : x?.items;
-          return Array.isArray(arr) && arr.length > 0;
-        }
-      ),
-    ]);
-    items = Array.isArray(data) ? data : (data?.items ?? []);
-  } catch {
-    return null;
+
+async function decideQuery(sp: URLSearchParams): Promise<MatchDecision> {
+  const dur = Number(sp.get("dur"));
+  return resolveTrack({
+    title: sp.get("title") || sp.get("q") || "",
+    artist: sp.get("artist") || "",
+    durationSec: dur > 0 ? dur : undefined,
+  });
+}
+
+async function loadProvider(
+  videoId: string,
+  kind: StreamKind,
+  range: string | null,
+  signal: AbortSignal,
+  src: string,
+  load: (signal: AbortSignal) => Promise<StreamSet>
+): Promise<Response> {
+  const data = await load(signal);
+  const urls = pickUrls(data, kind, 3);
+  if (!urls.length) throw new Error(`${src}: no usable stream`);
+  for (const url of urls) {
+    if (signal.aborted) throw new Error("aborted");
+    const res = await openUpstream({ url, range, kind, signal });
+    if (res) {
+      cacheUrl(videoId, kind, url);
+      return res;
+    }
   }
-  const vids = items
-    .map((i) => ({
-      id: i.url?.match(/[?&]v=([\w-]{11})/)?.[1] ?? "",
-      d: i.duration ?? 0,
-    }))
-    .filter((i) => i.id);
-  if (!vids.length) return null;
-  if (target > 0)
-    vids.sort((a, b) => Math.abs(a.d - target) - Math.abs(b.d - target));
-  return vids[0].id;
+  throw new Error(`${src}: all candidate URLs failed`);
 }
 
-async function pipeUpstream(url: string, range: string | null) {
-  const headers: Record<string, string> = {};
-  if (range) headers.range = range;
+function failureResponse(err: unknown) {
+  const message =
+    err instanceof AggregateError
+      ? err.errors
+          .map((e) => (e instanceof Error ? e.message : String(e)))
+          .join("; ")
+      : err instanceof Error
+        ? err.message
+        : "No playable stream found";
+  return NextResponse.json(
+    {
+      error: "No playable stream found",
+      code: classifyFailure(message),
+      detail: sanitizeError(message),
+    },
+    { status: 502 }
+  );
+}
 
-  let upstream: Response | null = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      upstream = await fetch(url, {
-        headers,
-        redirect: "follow",
-        signal: AbortSignal.timeout(30000),
-      });
-      if (upstream.ok || upstream.status === 206) break;
-      upstream = null;
-      break; // definite rejection — don't retry this URL
-    } catch {
-      upstream = null;
-      await new Promise((r) => setTimeout(r, 300));
+async function streamById(
+  videoId: string,
+  kind: StreamKind,
+  range: string | null,
+  fresh: boolean
+) {
+  if (!fresh) {
+    const hit = cachedUrl(videoId, kind);
+    if (hit) {
+      const cached = await openUpstream({ url: hit, range, kind });
+      if (cached) return cached;
+      urlCache.delete(`${videoId}:${kind}`);
     }
   }
 
-  if (!upstream || (!upstream.ok && upstream.status !== 206)) {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), 12000);
+  try {
+    // Losers are aborted. The deadline is cleared once a body is actually
+    // open so it cannot cut the winning stream off after the first bytes.
+    const res = await raceProviders<Response>([
+      (signal) =>
+        loadProvider(
+          videoId,
+          kind,
+          range,
+          AbortSignal.any([signal, deadline.signal]),
+          "innertube",
+          (s) => getInnertubeStreams(videoId, s)
+        ),
+      (signal) =>
+        loadProvider(
+          videoId,
+          kind,
+          range,
+          AbortSignal.any([signal, deadline.signal]),
+          "piped",
+          (s) =>
+            pipedFetch<StreamSet>(
+              `/streams/${videoId}`,
+              7000,
+              (x) =>
+                !!x &&
+                ((x.audioStreams?.length ?? 0) > 0 ||
+                  (x.videoStreams?.length ?? 0) > 0),
+              s
+            )
+        ),
+      (signal) =>
+        loadProvider(
+          videoId,
+          kind,
+          range,
+          AbortSignal.any([signal, deadline.signal]),
+          "invidious",
+          (s) => getInvidiousStreams(videoId, s)
+        ),
+    ]);
+    clearTimeout(timer);
+    return res;
+  } catch (err) {
+    clearTimeout(timer);
+    return failureResponse(err);
+  }
+}
+
+async function pipePassthrough(url: string, range: string | null) {
+  const headers: Record<string, string> = {};
+  if (range) headers.range = range;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const upstream = await fetch(url, {
+      headers,
+      redirect: "follow",
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!upstream.ok && upstream.status !== 206) return null;
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: proxyResponseHeaders(upstream.headers),
+    });
+  } catch {
+    clearTimeout(timer);
     return null;
   }
-
-  const pass = [
-    "content-type",
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "etag",
-    "last-modified",
-  ];
-  const resHeaders: Record<string, string> = { "cache-control": "no-store" };
-  for (const h of pass) {
-    const v = upstream.headers.get(h);
-    if (v) resHeaders[h] = v;
-  }
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: resHeaders,
-  });
 }
 
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const range = req.headers.get("range");
+  const meta = sp.get("meta") === "1";
+  const fresh = sp.get("fresh") === "1";
 
-  // Resolve videoId: ?v=ID directly, or ?q=song+artist&dur=seconds — the
-  // whole song→stream pipeline in ONE server invocation (kills a client
-  // round-trip and its whole failure surface).
   let videoId = sp.get("v");
-  if (!videoId && sp.get("q")) {
-    videoId = await resolveVideoId(
-      sp.get("q")!,
-      Number(sp.get("dur")) || 0
+  let decision: MatchDecision | null = null;
+  if (!videoId && (sp.get("q") || sp.get("title"))) {
+    try {
+      decision = await decideQuery(sp);
+    } catch (e) {
+      return NextResponse.json({ error: sanitizeError(e) }, { status: 502 });
+    }
+    videoId = canonicalVideoId(decision);
+  }
+
+  if (meta) {
+    return NextResponse.json({
+      videoId: videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId) ? videoId : null,
+      confidence: decision?.confidence ?? (videoId ? "high" : "low"),
+      alternatives: decision?.alternatives.map(pub) ?? [],
+    });
+  }
+
+  if ((sp.get("q") || sp.get("title")) && !sp.get("v") && !videoId) {
+    return NextResponse.json(
+      {
+        error: "low_confidence",
+        videoId: null,
+        confidence: decision?.confidence ?? "low",
+        alternatives: decision?.alternatives.map(pub) ?? [],
+      },
+      { status: 409 }
     );
   }
 
-  if (videoId && sp.get("meta") === "1") {
-    return NextResponse.json({ videoId });
-  }
-
-  // Mode 1: resolve + stream in one invocation. Cache hits skip everything;
-  // misses race all providers concurrently and probe each URL as it lands —
-  // the first one that yields bytes wins.
   if (videoId) {
-    if (!/^[A-Za-z0-9_-]{6,15}$/.test(videoId)) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
       return NextResponse.json({ error: "Invalid video id" }, { status: 400 });
     }
-    const kind = sp.get("kind") === "video" ? "video" : "audio";
-
-    const hit = cachedUrl(videoId, kind);
-    if (hit) {
-      const res = await pipeUpstream(hit, range);
-      if (res) return res;
-      urlCache.delete(`${videoId}:${kind}`);
-    }
-
-    try {
-      // Hard budget: rather fail in ~12s and let the client fall back to the
-      // official player than leave the user staring at a spinner for 20s+
-      const timeout = new Promise<never>((_, rej) =>
-        setTimeout(() => rej(new Error("resolution timeout")), 12000)
-      );
-      const res = await Promise.race([
-        Promise.any(
-          [
-            () =>
-              resolveOne(videoId, kind, "innertube", () =>
-                getInnertubeStreams(videoId)
-              ),
-            () =>
-              resolveOne(videoId, kind, "piped", () =>
-                pipedFetch<StreamSet>(
-                  `/streams/${videoId}`,
-                  7000,
-                  (x) =>
-                    !!x &&
-                    ((x.audioStreams?.length ?? 0) > 0 ||
-                      (x.videoStreams?.length ?? 0) > 0)
-                )
-              ),
-            () =>
-              resolveOne(videoId, kind, "invidious", () =>
-                getInvidiousStreams(videoId)
-              ),
-          ].map(async (job) => {
-            const { urls, src } = await job();
-            // try each candidate URL — a blocked format doesn't sink the
-            // whole provider
-            for (const url of urls) {
-              const r = await pipeUpstream(url, range);
-              if (r) {
-                cacheUrl(videoId, kind, url);
-                return r;
-              }
-            }
-            throw new Error(`${src}: all candidate URLs failed`);
-          })
-        ),
-        timeout,
-      ]);
-      return res;
-    } catch {
-      return NextResponse.json(
-        { error: "No playable stream found" },
-        { status: 502 }
-      );
-    }
+    const kind: StreamKind = sp.get("kind") === "video" ? "video" : "audio";
+    return streamById(videoId, kind, range, fresh);
   }
 
-  // Mode 2: passthrough proxy (thumbnails etc.)
   const url = sp.get("url");
   if (!url || !/^https:\/\//i.test(url)) {
     return NextResponse.json({ error: "Invalid url" }, { status: 400 });
@@ -269,9 +274,6 @@ export async function GET(req: NextRequest) {
   if (!ALLOWED_HOST.test(host)) {
     return NextResponse.json({ error: "Host not allowed" }, { status: 403 });
   }
-  const res = await pipeUpstream(url, range);
-  return (
-    res ??
-    NextResponse.json({ error: "Upstream failed" }, { status: 502 })
-  );
+  const res = await pipePassthrough(url, range);
+  return res ?? NextResponse.json({ error: "Upstream failed" }, { status: 502 });
 }

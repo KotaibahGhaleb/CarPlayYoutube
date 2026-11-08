@@ -67,11 +67,17 @@ const PLAYER_CLIENTS = [
   },
 ];
 
-async function playerCall(videoId: string): Promise<YTPlayerResponse> {
+async function playerCall(
+  videoId: string,
+  signal?: AbortSignal
+): Promise<YTPlayerResponse> {
   let lastErr: unknown = null;
   for (const c of PLAYER_CLIENTS) {
+    if (signal?.aborted) throw new Error("aborted");
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 6000);
+    const onAbort = () => ctrl.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
       const res = await fetch(
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
@@ -104,13 +110,17 @@ async function playerCall(videoId: string): Promise<YTPlayerResponse> {
       lastErr = e;
     } finally {
       clearTimeout(t);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error("YouTube failed");
 }
 
-export async function getInnertubeStreams(videoId: string) {
-  const d = await playerCall(videoId);
+export async function getInnertubeStreams(
+  videoId: string,
+  signal?: AbortSignal
+) {
+  const d = await playerCall(videoId, signal);
 
   const sd = d.streamingData;
   if (!sd || (!sd.formats?.length && !sd.adaptiveFormats?.length)) {
@@ -185,10 +195,13 @@ function parseDur(t?: string): number {
   return p.reduce((acc, n) => acc * 60 + n, 0);
 }
 
-export async function searchInnertube(query: string) {
+export async function searchInnertube(query: string, signal?: AbortSignal) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 8000);
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
+    if (signal?.aborted) throw new Error("aborted");
     const res = await fetch(
       "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
       {
@@ -242,5 +255,6 @@ export async function searchInnertube(query: string) {
     return out;
   } finally {
     clearTimeout(t);
+    signal?.removeEventListener("abort", onAbort);
   }
 }

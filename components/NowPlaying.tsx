@@ -20,29 +20,51 @@ function fmt(s: number) {
 export default function NowPlaying({
   track,
   playing,
+  buffering = false,
   time,
   dur,
   lyrics,
   resolving,
   streamError,
+  needsGesture = false,
+  choosing = false,
+  alternatives = [],
+  engineLabel = "",
   onToggle,
   onNext,
   onPrev,
   onSeek,
   onClose,
+  onChoose,
+  onOpenVersions,
+  onRetry,
 }: {
   track: PlayingTrack;
   playing: boolean;
+  buffering?: boolean;
   time: number;
   dur: number;
   lyrics: LyricsResult | null;
   resolving: boolean;
   streamError: string;
+  needsGesture?: boolean;
+  choosing?: boolean;
+  alternatives?: {
+    videoId: string;
+    title: string;
+    author: string;
+    durationSec: number;
+    notes?: string[];
+  }[];
+  engineLabel?: string;
   onToggle: () => void;
   onNext: () => void;
   onPrev: () => void;
   onSeek: (t: number) => void;
   onClose: () => void;
+  onChoose?: (videoId: string) => void;
+  onOpenVersions?: () => void;
+  onRetry?: () => void;
 }) {
   const activeIdx = lyrics?.synced
     ? activeLineIndex(lyrics.synced, time)
@@ -197,7 +219,37 @@ export default function NowPlaying({
             </div>
           </div>
           <div className="lyrics-fade scrollbar-hide absolute inset-0 overflow-y-auto py-[25vh] sm:inset-y-0">
-            {resolving ? (
+            {choosing ? (
+              <div className="mx-auto flex max-w-xl flex-col gap-2 px-4">
+                <p className="pb-2 text-center text-xl font-semibold">
+                  Choose version
+                </p>
+                {alternatives.length === 0 ? (
+                  <p className="text-center text-neutral-500">
+                    No other versions found
+                  </p>
+                ) : (
+                  alternatives.map((alt) => (
+                    <button
+                      key={alt.videoId}
+                      onClick={() => onChoose?.(alt.videoId)}
+                      className="rounded-2xl bg-neutral-900 px-4 py-3 text-left active:scale-[0.99]"
+                    >
+                      <span className="block truncate font-semibold">
+                        {alt.title}
+                      </span>
+                      <span className="mt-0.5 block truncate text-sm text-neutral-400">
+                        {alt.author}
+                        {alt.durationSec > 0
+                          ? ` · ${fmt(alt.durationSec)}`
+                          : ""}
+                        {alt.notes?.length ? ` · ${alt.notes.join(", ")}` : ""}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            ) : resolving ? (
               <div className="px-4 text-center">
                 <p className="text-xl font-semibold text-neutral-500">
                   Finding song…
@@ -209,9 +261,19 @@ export default function NowPlaying({
                 )}
               </div>
             ) : streamError ? (
-              <p className="px-4 text-center text-xl font-semibold text-red-400">
-                {streamError}
-              </p>
+              <div className="px-4 text-center">
+                <p className="text-xl font-semibold text-red-400">
+                  {streamError}
+                </p>
+                {onRetry && (
+                  <button
+                    onClick={onRetry}
+                    className="mt-4 rounded-full bg-white px-5 py-2 text-sm font-bold text-black"
+                  >
+                    Try again
+                  </button>
+                )}
+              </div>
             ) : lyrics?.synced?.length ? (
               lyrics.synced.map((l, i) => {
                 const dist = Math.abs(i - activeIdx);
@@ -267,6 +329,21 @@ export default function NowPlaying({
             />
           </div>
         </div>
+        <div className="mx-auto mb-1 flex max-w-3xl items-center justify-center gap-3 text-xs text-neutral-400">
+          {needsGesture && (
+            <span className="font-semibold text-white">Tap to play</span>
+          )}
+          {buffering && <span>Buffering…</span>}
+          {engineLabel && <span>{engineLabel}</span>}
+          {onOpenVersions && (
+            <button
+              onClick={onOpenVersions}
+              className="rounded-full bg-neutral-800 px-3 py-1 font-semibold text-neutral-200"
+            >
+              Choose version
+            </button>
+          )}
+        </div>
         <div className="mx-auto flex max-w-3xl items-center justify-between">
           <span className="w-14 text-xs tabular-nums text-neutral-500">
             {fmt(time)}
@@ -286,7 +363,9 @@ export default function NowPlaying({
               className="flex h-20 w-20 items-center justify-center rounded-full bg-white text-black transition active:scale-90"
               aria-label="Play/Pause"
             >
-              {playing ? (
+              {buffering ? (
+                <span className="h-7 w-7 animate-spin rounded-full border-2 border-black/20 border-t-black" />
+              ) : playing ? (
                 <svg viewBox="0 0 24 24" className="h-9 w-9 fill-current">
                   <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
                 </svg>

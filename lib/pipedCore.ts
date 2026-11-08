@@ -22,10 +22,17 @@ let cachedInstances: string[] | null = null;
 let cacheTime = 0;
 let lastGood: string | null = null;
 
-async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
+async function fetchJson<T>(
+  url: string,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<T> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
+    if (signal?.aborted) throw new Error("aborted");
     const res = await fetch(url, {
       signal: ctrl.signal,
       headers: { "User-Agent": "carplay-media/1.0" },
@@ -48,6 +55,7 @@ async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
     return body;
   } finally {
     clearTimeout(t);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -92,7 +100,8 @@ async function getInstances(): Promise<string[]> {
 export async function pipedFetch<T>(
   path: string,
   timeoutMs = 7000,
-  validate?: (d: T) => boolean
+  validate?: (d: T) => boolean,
+  signal?: AbortSignal
 ): Promise<T> {
   const instances = (await getInstances()).slice(0, 16);
   let lastError: unknown = null;
@@ -103,7 +112,7 @@ export async function pipedFetch<T>(
   try {
     const { base, data } = await Promise.any(
       instances.map(async (base) => {
-        const data = await fetchJson<T>(base + path, timeoutMs);
+        const data = await fetchJson<T>(base + path, timeoutMs, signal);
         // Some instances return HTTP 200 with an error body — treat as failure
         if (validate && !validate(data)) throw new Error("bad payload");
         return { base, data };

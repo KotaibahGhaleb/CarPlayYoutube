@@ -3,6 +3,7 @@
 import { useState } from "react";
 import YouTubeTab from "@/components/YouTubeTab";
 import MusicTab from "@/components/MusicTab";
+import PlaybackProvider from "@/components/PlaybackProvider";
 import RemoteProvider, {
   useRemote,
   useRemoteCommands,
@@ -111,7 +112,11 @@ function Shell() {
 export default function Home() {
   return (
     <RemoteProvider>
-      <Shell />
+      {/* Music stays mounted when its tab is hidden, and the player itself
+          lives outside that tree so a tab change cannot pause it. */}
+      <PlaybackProvider>
+        <Shell />
+      </PlaybackProvider>
     </RemoteProvider>
   );
 }

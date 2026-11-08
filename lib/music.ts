@@ -13,7 +13,8 @@ export interface Song {
   album?: string;
   art?: string;
   durationMs?: number;
-  youtubeId?: string; // set when the song comes from a YouTube playlist
+  youtubeId?: string; // set when the song comes from YouTube or a confirmed match
+  available?: boolean;
 }
 
 export interface SavedPlaylist {

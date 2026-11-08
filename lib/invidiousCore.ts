@@ -18,10 +18,17 @@ let cachedInstances: string[] | null = null;
 let cacheTime = 0;
 let lastGood: string | null = null;
 
-async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
+async function fetchJson<T>(
+  url: string,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<T> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
+    if (signal?.aborted) throw new Error("aborted");
     const res = await fetch(url, {
       signal: ctrl.signal,
       headers: { "User-Agent": "carplay-media/1.0" },
@@ -42,6 +49,7 @@ async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
     return body;
   } finally {
     clearTimeout(t);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -79,7 +87,11 @@ async function getInstances(): Promise<string[]> {
   return merged;
 }
 
-async function invFetch<T>(path: string, timeoutMs = 7000): Promise<T> {
+async function invFetch<T>(
+  path: string,
+  timeoutMs = 7000,
+  signal?: AbortSignal
+): Promise<T> {
   const instances = (await getInstances()).slice(0, 12);
   const BATCH = 4;
   let lastError: unknown = null;
@@ -90,7 +102,7 @@ async function invFetch<T>(path: string, timeoutMs = 7000): Promise<T> {
       const { base, data } = await Promise.any(
         batch.map(async (base) => ({
           base,
-          data: await fetchJson<T>(base + path, timeoutMs),
+          data: await fetchJson<T>(base + path, timeoutMs, signal),
         }))
       );
       lastGood = base.replace(/\/+$/, "");
@@ -140,8 +152,11 @@ function thumb(
 
 // Transform Invidious /api/v1/videos/{id} into the Piped streams shape the
 // rest of the app already understands.
-export async function getInvidiousStreams(videoId: string) {
-  const v = await invFetch<InvVideo>(`/api/v1/videos/${videoId}`);
+export async function getInvidiousStreams(
+  videoId: string,
+  signal?: AbortSignal
+) {
+  const v = await invFetch<InvVideo>(`/api/v1/videos/${videoId}`, 7000, signal);
 
   const audioStreams = (v.adaptiveFormats ?? [])
     .filter((f) => f.type?.startsWith("audio/"))
